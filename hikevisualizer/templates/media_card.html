@@ -1,0 +1,47 @@
+<div class="media-card {{ item.class }}" style="grid-column: span {{ item.columns }}; grid-row: span {{ item.rows }};" data-media-index="{{ item.index }}" data-track-id="{{ item.media.track_id }}">
+    {% if item.media.media_type.value == 'photo' %}
+    <img src="assets/{{ item.media.output_filename }}"
+         alt="{{ item.media.filename }}"
+         loading="lazy"
+         onclick="openLightbox({{ item.index }})"
+         class="media-card__image">
+
+    {% elif item.media.media_type.value == 'video' %}
+    <div class="media-card__video-container" onclick="openLightbox({{ item.index }})">
+        <video src="assets/{{ item.media.output_filename }}"
+               preload="metadata"
+               class="media-card__video">
+        </video>
+        <div class="media-card__play-overlay">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+        </div>
+    </div>
+
+    {% else %}
+    <div class="media-card__audio-container">
+        <div class="audio-card__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 18V5l12-2v13"></path>
+                <circle cx="6" cy="18" r="3"></circle>
+                <circle cx="18" cy="16" r="3"></circle>
+            </svg>
+        </div>
+        <div class="audio-card__info">
+            <span class="audio-card__filename">{{ item.media.filename }}</span>
+            {% if item.media.duration_seconds %}
+            <span class="audio-card__duration">{{ "%.0f"|format(item.media.duration_seconds // 60) }}:{{ "%02.0f"|format(item.media.duration_seconds % 60) }}</span>
+            {% endif %}
+        </div>
+        <audio src="assets/{{ item.media.output_filename }}" controls class="audio-card__player"></audio>
+    </div>
+    {% endif %}
+
+    <div class="media-card__caption">
+        <span class="media-card__time">{{ item.media.timestamp|localtime }}</span>
+        <p contenteditable="true"
+           class="media-card__description editable"
+           data-placeholder="Add a description for this {{ item.media.media_type.value }}..."></p>
+    </div>
+</div>

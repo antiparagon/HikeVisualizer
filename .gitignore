@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# OS files
+.DS_Store
+
+# Sensitive files
+mapbox-token
+
+# Generated output
+output/
+
+# Separate project directory
+hikeviz/

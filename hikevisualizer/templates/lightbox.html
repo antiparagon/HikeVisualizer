@@ -1,0 +1,28 @@
+<div id="lightbox" class="lightbox" onclick="closeLightbox(event)">
+    <button class="lightbox__close" onclick="closeLightbox(event)" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+    </button>
+
+    <button class="lightbox__nav lightbox__nav--prev" onclick="navigateLightbox(-1, event)" aria-label="Previous">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="15 18 9 12 15 6"></polyline>
+        </svg>
+    </button>
+
+    <div class="lightbox__content" onclick="event.stopPropagation()">
+        <!-- Content will be injected by JavaScript -->
+    </div>
+
+    <button class="lightbox__nav lightbox__nav--next" onclick="navigateLightbox(1, event)" aria-label="Next">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+    </button>
+
+    <div class="lightbox__counter">
+        <span id="lightbox-current">1</span> / <span id="lightbox-total">{{ media_items|length }}</span>
+    </div>
+</div>

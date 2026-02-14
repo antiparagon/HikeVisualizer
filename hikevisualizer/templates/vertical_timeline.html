@@ -1,0 +1,53 @@
+<div class="vertical-timeline">
+    <!-- Timeline line -->
+    <div class="timeline-line"></div>
+
+    <!-- Start time marker -->
+    <div class="timeline-marker timeline-marker-start">
+        <div class="marker-dot marker-dot-start"></div>
+        <div class="marker-label">
+            <span class="marker-time">{{ hike.start_time|localtime if hike.start_time else 'Start' }}</span>
+            <span class="marker-text">Start</span>
+        </div>
+    </div>
+
+    <!-- Media markers -->
+    {% for item in timeline_items %}
+    {% if item.type == 'media' %}
+    <div class="timeline-marker" style="top: {{ item.position }}%;" data-media-index="{{ item.index }}" data-track-id="{{ item.media.track_id }}">
+        <div class="marker-connector"></div>
+        <button class="marker-icon {{ item.media.icon_class }}" onclick="openLightbox({{ item.index }})" title="{{ item.media.filename }}">
+            {% if item.media.media_type.value == 'photo' %}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                <polyline points="21 15 16 10 5 21"></polyline>
+            </svg>
+            {% elif item.media.media_type.value == 'video' %}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+            {% else %}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 18V5l12-2v13"></path>
+                <circle cx="6" cy="18" r="3"></circle>
+                <circle cx="18" cy="16" r="3"></circle>
+            </svg>
+            {% endif %}
+        </button>
+        <div class="marker-label">
+            <span class="marker-time">{{ item.media.timestamp|localtime }}</span>
+        </div>
+    </div>
+    {% endif %}
+    {% endfor %}
+
+    <!-- End time marker -->
+    <div class="timeline-marker timeline-marker-end">
+        <div class="marker-dot marker-dot-end"></div>
+        <div class="marker-label">
+            <span class="marker-time">{{ hike.end_time|localtime if hike.end_time else 'End' }}</span>
+            <span class="marker-text">Finish</span>
+        </div>
+    </div>
+</div>

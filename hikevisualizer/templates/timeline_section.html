@@ -1,0 +1,15 @@
+{% for item in timeline_layout %}
+    {% if item.type == 'media' %}
+        {% include 'media_card.html' %}
+    {% elif item.type == 'text_block' %}
+        <div class="text-block {{ item.class }}" style="grid-column: span {{ item.columns }};">
+            <p contenteditable="true" class="editable" data-placeholder="{{ item.placeholder }}"></p>
+        </div>
+    {% endif %}
+{% endfor %}
+
+{% if not timeline_layout %}
+<div class="no-media-message">
+    <p>No media files found. Add photos, videos, or audio files to the media directory to populate this timeline.</p>
+</div>
+{% endif %}

@@ -1,0 +1,9 @@
+ python -m hikevisualizer \                                                                                                                       
+    --gpx your_hike.gpx \                                                                                                                          
+    --fit your_activity.fit \                                                                                                                      
+    --media ./photos \                                                                                                                             
+    --mapbox-token YOUR_MAPBOX_TOKEN \                                                                                                             
+    --output ./output  
+
+
+uv run -m hikevisualizer --gpx OneidaLakeWalk.gpx --fit 21765397982_ACTIVITY.fit --media /Users/wmckay/Downloads/FrozenOneidaLake
