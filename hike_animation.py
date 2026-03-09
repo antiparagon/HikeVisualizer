@@ -587,6 +587,13 @@ body{overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Rob
   color:#fff;font-size:24px;cursor:pointer;z-index:31;
   display:flex;align-items:center;justify-content:center;
 }
+#auto-media-toggle{
+  display:none;position:absolute;bottom:16px;left:50%;transform:translateX(-50%);
+  background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.15);
+  border-radius:20px;padding:5px 14px;color:rgba(255,255,255,0.6);
+  font-size:11px;cursor:pointer;transition:all .2s;white-space:nowrap;
+}
+#auto-media-toggle:hover{background:rgba(255,255,255,0.2);color:#fff}
 
 /* Loading overlay */
 #loading{
@@ -642,7 +649,7 @@ body{overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Rob
     <button data-color="solid">Solid</button>
   </div>
   <div class="toggle-row">
-    <label><input type="checkbox" id="auto-media"> Auto-show media</label>
+    <label><input type="checkbox" id="auto-media" checked> Auto-show media</label>
     <div class="delay-group">
       <input type="number" id="auto-media-delay" value="3" min="1" max="30" step="1">
       <span>sec</span>
@@ -666,6 +673,7 @@ body{overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Rob
 <div id="media-popup">
   <button id="media-popup-close">&times;</button>
   <div id="media-popup-content"></div>
+  <button id="auto-media-toggle">&#9646;&#9646; keep viewing</button>
 </div>
 
 <script type="importmap">
@@ -1502,12 +1510,15 @@ function checkMediaTriggers(currentProgress) {
 
 let wasPlayingBeforePopup = false;
 
+let isAutoShowing = false; // true while an auto-show timer/media-end listener is active
+
 function showFullMedia(media, isAutoShow) {
     const popup = document.getElementById('media-popup');
     const content = document.getElementById('media-popup-content');
+    const toggleBtn = document.getElementById('auto-media-toggle');
 
-    // Clear any pending auto-dismiss timer
-    if (autoMediaTimer) { clearTimeout(autoMediaTimer); autoMediaTimer = null; }
+    // Clear any pending auto-dismiss
+    cancelAutoDismiss();
 
     // Pause animation while viewing media
     wasPlayingBeforePopup = isPlaying;
@@ -1519,30 +1530,43 @@ function showFullMedia(media, isAutoShow) {
 
     if (media.media_type === 'photo') {
         content.innerHTML = '<img src="assets/' + media.output_filename + '">';
-        // Auto-dismiss after delay for photos
-        if (isAutoShow) {
-            const delay = parseFloat(document.getElementById('auto-media-delay').value) || 3;
-            autoMediaTimer = setTimeout(() => { autoMediaTimer = null; closeMediaPopup(); }, delay * 1000);
-        }
     } else if (media.media_type === 'video') {
         content.innerHTML = '<video src="assets/' + media.output_filename + '" controls autoplay style="max-width:90vw;max-height:85vh"></video>';
-        // Auto-dismiss when video ends
-        if (isAutoShow) {
-            const vid = content.querySelector('video');
-            vid.addEventListener('ended', () => closeMediaPopup(), { once: true });
-        }
     } else {
         content.innerHTML = '<div style="background:#222;padding:40px;border-radius:12px;text-align:center;color:#fff"><p style="margin-bottom:16px">' + media.filename + '</p><audio src="assets/' + media.output_filename + '" controls autoplay></audio></div>';
-        if (isAutoShow) {
-            const aud = content.querySelector('audio');
-            aud.addEventListener('ended', () => closeMediaPopup(), { once: true });
-        }
     }
     popup.classList.add('visible');
+
+    // Set up auto-dismiss if this is auto-shown
+    if (isAutoShow) {
+        isAutoShowing = true;
+        toggleBtn.style.display = 'block';
+        toggleBtn.innerHTML = '&#9646;&#9646; keep viewing';
+        if (media.media_type === 'photo') {
+            const delay = parseFloat(document.getElementById('auto-media-delay').value) || 3;
+            autoMediaTimer = setTimeout(() => { autoMediaTimer = null; closeMediaPopup(); }, delay * 1000);
+        } else if (media.media_type === 'video') {
+            const vid = content.querySelector('video');
+            vid.onended = () => closeMediaPopup();
+        } else {
+            const aud = content.querySelector('audio');
+            aud.onended = () => closeMediaPopup();
+        }
+    }
+}
+
+function cancelAutoDismiss() {
+    if (autoMediaTimer) { clearTimeout(autoMediaTimer); autoMediaTimer = null; }
+    const vid = document.querySelector('#media-popup-content video');
+    if (vid) vid.onended = null;
+    const aud = document.querySelector('#media-popup-content audio');
+    if (aud) aud.onended = null;
+    document.getElementById('auto-media-toggle').style.display = 'none';
+    isAutoShowing = false;
 }
 
 function closeMediaPopup() {
-    if (autoMediaTimer) { clearTimeout(autoMediaTimer); autoMediaTimer = null; }
+    cancelAutoDismiss();
     // Stop any playing video/audio
     const vid = document.querySelector('#media-popup-content video');
     if (vid) { vid.pause(); vid.src = ''; }
@@ -1757,7 +1781,7 @@ document.querySelectorAll('#color-group button').forEach(btn => {
 document.getElementById('auto-media').addEventListener('change', (e) => {
     if (!e.target.checked) {
         autoMediaQueue = [];
-        if (autoMediaTimer) { clearTimeout(autoMediaTimer); autoMediaTimer = null; }
+        cancelAutoDismiss();
     }
 });
 
@@ -1765,6 +1789,11 @@ document.getElementById('auto-media').addEventListener('change', (e) => {
 document.getElementById('media-popup-close').addEventListener('click', closeMediaPopup);
 document.getElementById('media-popup').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) closeMediaPopup();
+});
+// "Keep viewing" button: cancel auto-dismiss, user closes manually
+document.getElementById('auto-media-toggle').addEventListener('click', (e) => {
+    e.stopPropagation();
+    cancelAutoDismiss();
 });
 
 // Keyboard shortcuts
