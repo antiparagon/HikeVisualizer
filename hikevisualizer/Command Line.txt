@@ -6,4 +6,11 @@
     --output ./output  
 
 
-uv run -m hikevisualizer --gpx OneidaLakeWalk.gpx --fit 21765397982_ACTIVITY.fit --media /Users/wmckay/Downloads/FrozenOneidaLake
+uv run -m hikevisualizer --dir /Users/wmckay/Bucket/FrozenOneidaLake
+uv run -m hikevisualizer --dir /Users/wmckay/Bucket/FrozenJonesHill
+uv run -m hikevisualizer --dir "/Users/wmckay/My Drive/Adventures/FrozenOneidaLake" --publish
+
+uv run -m hikevisualizer --dir "/Users/wmckay/My Drive/Adventures/HadleyFT_Feb2026Adv" --publish
+
+
+uv run hike_animation.py --dir '/Users/wmckay/Bucket/Snowy Mountain Feb 2023'

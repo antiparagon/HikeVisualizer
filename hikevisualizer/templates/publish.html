@@ -1,31 +1,33 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ hike.name }} - Hike Visualization</title>
+<!--
+  HikeVisualizer Embeddable Content
 
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  To embed this in your webpage:
+  1. Copy everything below into your page where you want the hike visualization.
+  2. Make sure the assets/ folder is accessible at the same path as your page.
+  3. If you already have Mapbox GL JS loaded, you can remove the script tags below.
+-->
 
-    <!-- Mapbox GL JS -->
-    <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet">
-    <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+<!-- Required: Google Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 
-    <!-- Pannellum 360 Viewer -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css">
-    <script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
+<!-- Required: Mapbox GL JS -->
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet">
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
 
-    <style>
-        {{ css_content|safe }}
-    </style>
-</head>
-<body>
+<!-- Pannellum 360 Viewer -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css">
+<script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
+
+<style>
+{{ css_content|safe }}
+</style>
+
+<div class="hike-visualizer-embed">
     <!-- Header Section -->
     <header class="hike-header">
-        <h1 contenteditable="true" class="editable" data-placeholder="Enter hike title...">{{ hike.name }}</h1>
+        <h1>{{ hike.name }}</h1>
         <p class="hike-meta">
             <span class="meta-item">
                 <svg class="meta-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -136,6 +138,14 @@
         </div>
     </section>
 
+    <!-- Description Section -->
+    <section class="description-section">
+        <h2 class="section-title">Description</h2>
+        <div class="description-content">
+            <p>This {{ "%.2f"|format(hike.distance_miles) }} mile hike was completed in {{ hike.duration_formatted }} with an average speed of {{ hike.avg_speed_formatted }} mph.</p>
+        </div>
+    </section>
+
     <!-- Elevation Section -->
     {% include 'elevation_section.html' %}
 
@@ -159,7 +169,7 @@
 
     <!-- Timeline/Article Section -->
     <section class="timeline-section">
-        <h2 contenteditable="true" class="editable section-title" data-placeholder="Enter section title...">Timeline</h2>
+        <h2 class="section-title">Timeline</h2>
 
         <div class="timeline-container">
             <!-- Vertical Timeline -->
@@ -175,7 +185,7 @@
     <!-- Gallery Section (Media Outside Hike Time Range) -->
     {% if gallery_layout %}
     <section class="gallery-section">
-        <h2 contenteditable="true" class="editable section-title" data-placeholder="Enter section title...">More Photos</h2>
+        <h2 class="section-title">More Photos</h2>
         <div class="gallery-grid">
             {% for item in gallery_layout %}
             {% if item.type == 'media' %}
@@ -227,15 +237,14 @@
 
     <!-- Lightbox Modal -->
     {% include 'lightbox.html' %}
+</div>
 
-    <!-- Mapbox JS -->
-    <script>
-        {{ js_content|safe }}
-    </script>
+<!-- Mapbox JS -->
+<script>
+    {{ js_content|safe }}
+</script>
 
-    <!-- Lightbox JS -->
-    <script>
-        {{ lightbox_js|safe }}
-    </script>
-</body>
-</html>
+<!-- Lightbox JS -->
+<script>
+    {{ lightbox_js|safe }}
+</script>

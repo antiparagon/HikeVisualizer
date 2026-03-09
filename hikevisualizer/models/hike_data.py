@@ -106,6 +106,22 @@ class HikeData:
         minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
+    @property
+    def avg_speed_mph(self) -> Optional[float]:
+        """Average speed in miles per hour."""
+        if not self.duration or self.duration.total_seconds() == 0:
+            return None
+        hours = self.duration.total_seconds() / 3600
+        return self.distance_miles / hours
+
+    @property
+    def avg_speed_formatted(self) -> str:
+        """Format average speed as X.X mph."""
+        speed = self.avg_speed_mph
+        if speed is None:
+            return "--"
+        return f"{speed:.1f}"
+
     def to_geojson(self) -> dict:
         """Convert track to GeoJSON LineString."""
         return {

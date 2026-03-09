@@ -68,6 +68,8 @@ def generate_site(
     offline: bool = False,
     copy_media: bool = True,
     verbose: bool = False,
+    include_story_sections: bool = False,
+    publish: bool = False,
 ) -> Path:
     """
     Main site generation orchestrator.
@@ -257,7 +259,7 @@ def generate_site(
     _associate_media_with_tracks(hike_data.media_items, individual_tracks)
 
     # Generate timeline layout only for media during the hike
-    timeline_layout = _calculate_timeline_layout(timeline_media)
+    timeline_layout = _calculate_timeline_layout(timeline_media, include_story_sections)
     timeline_items = _calculate_timeline_items(hike_data, timeline_media)
 
     # 7b. Detect timezone from GPS coordinates
@@ -292,22 +294,27 @@ def generate_site(
     # Calculate gallery layout for media outside hike time
     gallery_layout = _calculate_gallery_layout(gallery_media, len(timeline_media))
 
+    # Create ordered media list matching layout indices: timeline first, then gallery
+    ordered_media = timeline_media + gallery_media
+
     # 10. Render template
-    template = env.get_template("base.html")
+    template_name = "publish.html" if publish else "base.html"
+    template = env.get_template(template_name)
     html_content = template.render(
         hike=hike_data,
         timeline_layout=timeline_layout,
         timeline_items=timeline_items,
-        media_items=hike_data.media_items,
+        media_items=ordered_media,
         gallery_layout=gallery_layout,
         track_info=track_info,
         css_content=_get_css_content(),
         js_content=js_content,
-        lightbox_js=_get_lightbox_js(hike_data.media_items),
+        lightbox_js=_get_lightbox_js(ordered_media),
         chart_width=chart_width,
         chart_height=chart_height,
         elevation_path=elevation_path,
         elevation_line=elevation_line,
+        publish=publish,
     )
 
     # Write HTML
@@ -542,7 +549,7 @@ def _associate_media_with_tracks(media_items: list, tracks: list) -> None:
         media.track_id = best_track_id
 
 
-def _calculate_timeline_layout(media_items: List[MediaItem]) -> List[dict]:
+def _calculate_timeline_layout(media_items: List[MediaItem], include_story_sections: bool = False) -> List[dict]:
     """
     Calculate magazine-style timeline layout.
 
@@ -592,8 +599,9 @@ def _calculate_timeline_layout(media_items: List[MediaItem]) -> List[dict]:
 
         layout.append(layout_item)
 
-    # Insert text blocks at intervals
-    layout = _insert_text_blocks(layout, interval=3)
+    # Insert text blocks at intervals only if story sections are enabled
+    if include_story_sections:
+        layout = _insert_text_blocks(layout, interval=3)
 
     return layout
 
@@ -624,7 +632,7 @@ def _insert_text_blocks(layout: List[dict], interval: int = 3) -> List[dict]:
 
 
 def _calculate_timeline_items(hike_data: HikeData, media_list: List[MediaItem]) -> List[dict]:
-    """Calculate vertical timeline item positions."""
+    """Calculate vertical timeline item positions, grouping closely-timed media."""
     items = []
 
     if not hike_data.start_time or not hike_data.end_time or not media_list:
@@ -634,19 +642,72 @@ def _calculate_timeline_items(hike_data: HikeData, media_list: List[MediaItem]) 
     if total_duration == 0:
         return items
 
+    # Minimum percentage distance between markers to prevent overlap
+    MIN_POSITION_GAP = 6.0  # percent
+
+    # First pass: calculate raw positions
+    raw_items = []
     for i, media in enumerate(media_list):
         elapsed = (media.timestamp - hike_data.start_time).total_seconds()
         position = (elapsed / total_duration) * 100
         position = max(5, min(95, position))  # Clamp to avoid edges
+        raw_items.append({
+            "media": media,
+            "index": i,
+            "position": position,
+        })
 
-        items.append(
-            {
+    # Second pass: group items that are too close together
+    if not raw_items:
+        return items
+
+    groups = []
+    current_group = [raw_items[0]]
+
+    for item in raw_items[1:]:
+        # Check if this item is close to the last item in current group
+        last_position = current_group[-1]["position"]
+        if abs(item["position"] - last_position) < MIN_POSITION_GAP:
+            # Add to current group
+            current_group.append(item)
+        else:
+            # Start a new group
+            groups.append(current_group)
+            current_group = [item]
+
+    # Don't forget the last group
+    groups.append(current_group)
+
+    # Third pass: create timeline items from groups
+    for group in groups:
+        if len(group) == 1:
+            # Single item - no grouping needed
+            item = group[0]
+            items.append({
                 "type": "media",
-                "media": media,
-                "index": i,
-                "position": position,
-            }
-        )
+                "media": item["media"],
+                "index": item["index"],
+                "position": item["position"],
+                "grouped": False,
+                "group_count": 1,
+            })
+        else:
+            # Multiple items - create a grouped marker
+            # Use the average position for the group
+            avg_position = sum(item["position"] for item in group) / len(group)
+            avg_position = max(5, min(95, avg_position))
+
+            # Use the first item as the primary, but include all indices
+            items.append({
+                "type": "media_group",
+                "media": group[0]["media"],  # Primary media for icon
+                "index": group[0]["index"],  # First index for lightbox
+                "position": avg_position,
+                "grouped": True,
+                "group_count": len(group),
+                "group_indices": [item["index"] for item in group],
+                "group_media": [item["media"] for item in group],
+            })
 
     return items
 
@@ -744,6 +805,7 @@ def _get_lightbox_js(media_items: List[MediaItem]) -> str:
                 "type": media.media_type.value,
                 "src": f"assets/{media.output_filename}",
                 "filename": media.filename,
+                "is360": media.is_360,
             }
         )
 
@@ -754,6 +816,7 @@ def _get_lightbox_js(media_items: List[MediaItem]) -> str:
     return f"""
 const mediaItems = {media_json};
 let currentIndex = 0;
+let currentPanoramaViewer = null;
 
 function openLightbox(index) {{
     currentIndex = index;
@@ -761,11 +824,76 @@ function openLightbox(index) {{
     const content = lightbox.querySelector('.lightbox__content');
     const media = mediaItems[index];
 
+    // Destroy existing panorama viewer if any
+    if (currentPanoramaViewer) {{
+        currentPanoramaViewer.destroy();
+        currentPanoramaViewer = null;
+    }}
+
+    // Detect mobile devices
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
     let html = '';
-    if (media.type === 'photo') {{
+    if (media.type === 'photo' && media.is360) {{
+        if (isMobile) {{
+            // On mobile, show regular image with option to try 360 view
+            html = `
+                <div class="lightbox__360-mobile">
+                    <img src="${{media.src}}" alt="${{media.filename}}" class="lightbox__image">
+                    <button class="lightbox__360-btn" onclick="load360Viewer(${{index}})">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+                        </svg>
+                        Try 360&deg; View
+                    </button>
+                </div>`;
+            content.innerHTML = html;
+        }} else {{
+            // Desktop: use Pannellum viewer
+            html = `<div id="panorama-viewer" class="lightbox__panorama"></div>`;
+            content.innerHTML = html;
+
+            // Convert relative path to absolute URL for Pannellum
+            const baseUrl = window.location.href.substring(0, window.location.href.lastIndexOf('/') + 1);
+            const absoluteSrc = media.src.startsWith('http') ? media.src : baseUrl + media.src;
+
+            // Initialize Pannellum after DOM update
+            setTimeout(() => {{
+                try {{
+                    currentPanoramaViewer = pannellum.viewer('panorama-viewer', {{
+                        type: 'equirectangular',
+                        panorama: absoluteSrc,
+                        autoLoad: true,
+                        showControls: true,
+                        mouseZoom: true,
+                        autoRotate: -2,
+                        compass: true,
+                        hfov: 100,
+                                                showZoomCtrl: true,
+                        showFullscreenCtrl: true,
+                        strings: {{
+                            loadingLabel: 'Loading 360&deg; view...'
+                        }}
+                    }});
+
+                    // Handle Pannellum errors - fallback to regular image
+                    currentPanoramaViewer.on('error', function(err) {{
+                        console.warn('Pannellum error, falling back to image:', err);
+                        content.innerHTML = `<img src="${{media.src}}" alt="${{media.filename}}" class="lightbox__image">`;
+                        currentPanoramaViewer = null;
+                    }});
+                }} catch (e) {{
+                    console.warn('Pannellum failed to initialize:', e);
+                    content.innerHTML = `<img src="${{media.src}}" alt="${{media.filename}}" class="lightbox__image">`;
+                }}
+            }}, 50);
+        }}
+    }} else if (media.type === 'photo') {{
         html = `<img src="${{media.src}}" alt="${{media.filename}}" class="lightbox__image">`;
+        content.innerHTML = html;
     }} else if (media.type === 'video') {{
         html = `<video src="${{media.src}}" controls autoplay class="lightbox__video"></video>`;
+        content.innerHTML = html;
     }} else {{
         html = `<div class="lightbox__audio">
             <div class="lightbox__audio-icon">
@@ -778,9 +906,9 @@ function openLightbox(index) {{
             <p class="lightbox__audio-filename">${{media.filename}}</p>
             <audio src="${{media.src}}" controls autoplay></audio>
         </div>`;
+        content.innerHTML = html;
     }}
 
-    content.innerHTML = html;
     document.getElementById('lightbox-current').textContent = index + 1;
     document.getElementById('lightbox-total').textContent = mediaItems.length;
     lightbox.classList.add('lightbox--active');
@@ -795,6 +923,12 @@ function closeLightbox(event) {{
     lightbox.classList.remove('lightbox--active');
     document.body.style.overflow = '';
 
+    // Destroy panorama viewer
+    if (currentPanoramaViewer) {{
+        currentPanoramaViewer.destroy();
+        currentPanoramaViewer = null;
+    }}
+
     // Stop any playing media
     const video = lightbox.querySelector('video');
     const audio = lightbox.querySelector('audio');
@@ -808,6 +942,45 @@ function navigateLightbox(direction, event) {{
     if (newIndex >= 0 && newIndex < mediaItems.length) {{
         openLightbox(newIndex);
     }}
+}}
+
+// Load 360 viewer on mobile (called when user taps the button)
+function load360Viewer(index) {{
+    const media = mediaItems[index];
+    const content = document.querySelector('.lightbox__content');
+
+    content.innerHTML = `<div id="panorama-viewer" class="lightbox__panorama"></div>`;
+
+    const baseUrl = window.location.href.substring(0, window.location.href.lastIndexOf('/') + 1);
+    const absoluteSrc = media.src.startsWith('http') ? media.src : baseUrl + media.src;
+
+    setTimeout(() => {{
+        try {{
+            currentPanoramaViewer = pannellum.viewer('panorama-viewer', {{
+                type: 'equirectangular',
+                panorama: absoluteSrc,
+                autoLoad: true,
+                showControls: true,
+                mouseZoom: false,
+                autoRotate: 0,
+                compass: true,
+                hfov: 90,
+                                showZoomCtrl: true,
+                showFullscreenCtrl: true
+            }});
+
+            currentPanoramaViewer.on('error', function(err) {{
+                console.warn('Pannellum error:', err);
+                alert('Unable to load 360&deg; view. The image may be too large for this device.');
+                content.innerHTML = `<img src="${{media.src}}" alt="${{media.filename}}" class="lightbox__image">`;
+                currentPanoramaViewer = null;
+            }});
+        }} catch (e) {{
+            console.warn('Pannellum failed:', e);
+            alert('Unable to load 360&deg; view on this device.');
+            content.innerHTML = `<img src="${{media.src}}" alt="${{media.filename}}" class="lightbox__image">`;
+        }}
+    }}, 50);
 }}
 
 // Keyboard navigation
@@ -919,8 +1092,30 @@ body {
 .map-section {
     position: relative;
     width: 100%;
-    height: 70vh;
-    min-height: 500px;
+    max-width: var(--max-width);
+    margin: 0 auto;
+    transition: all 0.3s ease;
+}
+
+.map-section--minimized {
+    height: 300px;
+    padding: 0 var(--spacing-unit);
+}
+
+.map-section--minimized .map-container {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.map-section--expanded {
+    max-width: 100%;
+    height: 80vh;
+    min-height: 600px;
+    padding: 0;
+}
+
+.map-section--expanded .map-container {
+    border-radius: 0;
 }
 
 .map-container {
@@ -928,15 +1123,83 @@ body {
     height: 100%;
 }
 
+/* Map Toggle Button */
+.map-toggle {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    background: rgba(255, 255, 255, 0.95);
+    border: none;
+    border-radius: 20px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    cursor: pointer;
+    font-family: var(--font-sans);
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: var(--color-text);
+    transition: all 0.2s;
+}
+
+.map-toggle:hover {
+    background: white;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.map-toggle__icon {
+    width: 16px;
+    height: 16px;
+}
+
+.map-toggle__icon--collapse {
+    display: none;
+}
+
+.map-section--expanded .map-toggle__icon--expand {
+    display: none;
+}
+
+.map-section--expanded .map-toggle__icon--collapse {
+    display: block;
+}
+
+.map-section--minimized .map-toggle {
+    left: calc(50% + var(--spacing-unit) / 2);
+}
+
 .map-legend {
     position: absolute;
-    bottom: 20px;
-    left: 20px;
+    bottom: 12px;
+    left: 12px;
     background: rgba(255, 255, 255, 0.95);
-    padding: 12px 16px;
+    padding: 10px 14px;
     border-radius: 8px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-    font-size: 0.875rem;
+    font-size: 0.8125rem;
+}
+
+.map-section--minimized .map-legend {
+    left: calc(var(--spacing-unit) + 12px);
+    bottom: 12px;
+    padding: 8px 10px;
+}
+
+.map-section--minimized .map-legend .legend-gradient {
+    width: 100px;
+    height: 8px;
+}
+
+.map-section--minimized .map-legend .legend-label {
+    font-size: 0.6875rem;
+}
+
+.map-section--minimized .map-legend .legend-labels {
+    display: none;
 }
 
 .legend-gradient {
@@ -957,16 +1220,20 @@ body {
 /* Track Toggles */
 .track-toggles {
     position: absolute;
-    top: 20px;
-    right: 20px;
+    top: 50px;
+    right: 12px;
     background: rgba(255, 255, 255, 0.95);
-    padding: 12px 16px;
+    padding: 10px 14px;
     border-radius: 8px;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-    font-size: 0.875rem;
+    font-size: 0.8125rem;
     display: none;
-    max-height: calc(100% - 40px);
+    max-height: calc(100% - 70px);
     overflow-y: auto;
+}
+
+.map-section--minimized .track-toggles {
+    right: calc(var(--spacing-unit) + 12px);
 }
 
 .track-toggles__title {
@@ -1002,6 +1269,26 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 150px;
+}
+
+/* Description Section */
+.description-section {
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: calc(var(--spacing-unit) * 2) var(--spacing-unit);
+}
+
+.description-content {
+    background: var(--color-bg-alt);
+    border-radius: 8px;
+    padding: calc(var(--spacing-unit) * 1.5);
+}
+
+.description-content p {
+    font-size: 1rem;
+    line-height: 1.7;
+    color: var(--color-text);
+    margin: 0;
 }
 
 /* Track Filter (before Timeline) */
@@ -1306,6 +1593,29 @@ body {
     height: 16px;
 }
 
+.marker-icon--grouped {
+    position: relative;
+}
+
+.marker-icon__count {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    background: var(--color-accent);
+    color: white;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px solid white;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
 .marker-label {
     position: absolute;
     left: calc(100% + 8px);
@@ -1472,6 +1782,75 @@ body {
     font-size: 0.875rem;
     margin-top: 0.25rem;
     min-height: 1.5em;
+}
+
+/* 360 Photo Badge */
+.media-card__360-badge {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 10px;
+    background: rgba(0, 0, 0, 0.7);
+    border-radius: 20px;
+    color: white;
+    font-size: 0.75rem;
+    font-weight: 600;
+    pointer-events: none;
+}
+
+.media-card__360-badge svg {
+    width: 16px;
+    height: 16px;
+}
+
+.media-card--360 {
+    cursor: pointer;
+}
+
+/* 360 Viewer Container */
+.panorama-viewer {
+    width: 100%;
+    height: 100%;
+    min-height: 400px;
+}
+
+.lightbox__panorama {
+    width: 90vw;
+    height: 80vh;
+    max-width: 1400px;
+}
+
+.lightbox__360-mobile {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.lightbox__360-btn {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 20px;
+    background: rgba(0, 0, 0, 0.8);
+    border: 2px solid white;
+    border-radius: 30px;
+    color: white;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.lightbox__360-btn:hover {
+    background: rgba(59, 130, 246, 0.9);
 }
 
 /* Text Blocks */

@@ -28,6 +28,7 @@ class MediaItem:
     width: Optional[int] = None
     height: Optional[int] = None
     duration_seconds: Optional[float] = None  # For video/audio
+    is_360: bool = False  # True for 360/panoramic photos
 
     # Calculated during merge
     nearest_trackpoint_index: Optional[int] = None
@@ -65,4 +66,5 @@ class MediaItem:
             "trackpoint_index": self.nearest_trackpoint_index,
             "distance": self.distance_from_start,
             "track_id": self.track_id,
+            "is_360": self.is_360,
         }

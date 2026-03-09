@@ -21,8 +21,9 @@ class MediaScanner:
     VIDEO_EXTENSIONS: Set[str] = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
     AUDIO_EXTENSIONS: Set[str] = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
-    def __init__(self, media_dir: str):
+    def __init__(self, media_dir: str, exclude_dirs: Optional[List[str]] = None):
         self.media_dir = Path(media_dir)
+        self.exclude_dirs = exclude_dirs or ["output", "assets"]
 
     def scan(self) -> List[MediaItem]:
         """Scan directory recursively for media files."""
@@ -32,6 +33,9 @@ class MediaScanner:
             return media_items
 
         for file_path in self.media_dir.rglob("*"):
+            # Skip files in excluded directories
+            if any(excluded in file_path.parts for excluded in self.exclude_dirs):
+                continue
             if file_path.is_file():
                 media_item = self._process_file(file_path)
                 if media_item:
@@ -63,6 +67,7 @@ class MediaScanner:
                 # Try multiple methods to get EXIF datetime
                 timestamp = self._extract_photo_datetime(img)
                 width, height = img.size
+                is_360 = self._detect_360_photo(file_path, img, width, height)
 
                 return MediaItem(
                     file_path=str(file_path.absolute()),
@@ -72,6 +77,7 @@ class MediaScanner:
                     output_filename=self._sanitize_filename(file_path.name),
                     width=width,
                     height=height,
+                    is_360=is_360,
                 )
         except Exception:
             # If PIL fails, try to create a basic entry
@@ -135,6 +141,7 @@ class MediaScanner:
                 # Extract EXIF using modern API
                 timestamp = self._extract_heic_datetime(img)
                 width, height = img.size
+                is_360 = self._detect_360_photo(file_path, img, width, height)
 
                 # Change output extension to .jpg for web compatibility
                 base_name = file_path.stem
@@ -148,6 +155,7 @@ class MediaScanner:
                     output_filename=output_name,
                     width=width,
                     height=height,
+                    is_360=is_360,
                 )
         except ImportError:
             # pillow-heif not installed, create basic entry
@@ -349,3 +357,54 @@ class MediaScanner:
         # Replace spaces and special chars
         sanitized = re.sub(r"[^\w\-_.]", "_", filename)
         return sanitized.lower()
+
+    def _detect_360_photo(
+        self, file_path: Path, img: Image.Image, width: int, height: int
+    ) -> bool:
+        """
+        Detect if a photo is a 360/equirectangular panorama.
+
+        Detection methods:
+        1. XMP metadata with GPano:ProjectionType = "equirectangular"
+        2. Aspect ratio close to 2:1 (equirectangular projection standard)
+        3. Filename contains "pano", "360", or "sphere"
+        """
+        # Method 1: Check XMP metadata for GPano projection type
+        try:
+            # Read raw file bytes to find XMP data
+            with open(file_path, "rb") as f:
+                # Read first 64KB which should contain XMP header
+                data = f.read(65536)
+                data_str = data.decode("utf-8", errors="ignore")
+
+                # Look for GPano namespace indicators
+                if "GPano:ProjectionType" in data_str:
+                    if "equirectangular" in data_str.lower():
+                        return True
+
+                # Also check for Google Photo Sphere XMP
+                if "ProjectionType" in data_str and "equirectangular" in data_str.lower():
+                    return True
+
+                # Check for UsePanoramaViewer tag
+                if "GPano:UsePanoramaViewer" in data_str:
+                    if ">True<" in data_str or ">true<" in data_str:
+                        return True
+        except Exception:
+            pass
+
+        # Method 2: Check aspect ratio (2:1 is standard for equirectangular)
+        if width and height and height > 0:
+            aspect_ratio = width / height
+            # Allow some tolerance (1.9 to 2.1)
+            if 1.9 <= aspect_ratio <= 2.1:
+                # Additional check: must be high resolution for 360
+                if width >= 4000:
+                    return True
+
+        # Method 3: Check filename for common 360 indicators
+        filename_lower = file_path.name.lower()
+        if any(indicator in filename_lower for indicator in ["_pano", "360", "sphere", "equirect"]):
+            return True
+
+        return False

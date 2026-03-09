@@ -102,6 +102,18 @@ Environment Variables:
         help="Enable verbose output",
     )
 
+    parser.add_argument(
+        "--story",
+        action="store_true",
+        help="Include template story sections in the timeline for adding narrative text",
+    )
+
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Generate embeddable HTML fragment for pasting into a template page",
+    )
+
     return parser
 
 
@@ -231,9 +243,15 @@ def main():
             offline=args.offline,
             copy_media=not args.no_media_copy,
             verbose=args.verbose,
+            include_story_sections=args.story,
+            publish=args.publish,
         )
         print(f"Successfully generated site at: {output_path}")
-        print(f"Open {output_path / 'index.html'} in your browser to view.")
+        if args.publish:
+            print(f"Embeddable HTML generated at: {output_path / 'index.html'}")
+            print("Copy the contents into your template page. See comments in the file for setup instructions.")
+        else:
+            print(f"Open {output_path / 'index.html'} in your browser to view.")
     except Exception as e:
         print(f"Error generating site: {e}", file=sys.stderr)
         if args.verbose:

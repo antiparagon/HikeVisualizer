@@ -460,6 +460,31 @@ map.on('load', () => {{
         toggleContainer.style.display = 'block';
     }}
 }});
+
+// Toggle map size between minimized and expanded
+function toggleMapSize() {{
+    const mapSection = document.getElementById('map-section');
+    const toggleBtn = document.getElementById('map-toggle');
+    const toggleText = toggleBtn.querySelector('.map-toggle__text');
+
+    if (mapSection.classList.contains('map-section--minimized')) {{
+        mapSection.classList.remove('map-section--minimized');
+        mapSection.classList.add('map-section--expanded');
+        toggleText.textContent = 'Minimize Map';
+
+        // Scroll to map
+        mapSection.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+    }} else {{
+        mapSection.classList.remove('map-section--expanded');
+        mapSection.classList.add('map-section--minimized');
+        toggleText.textContent = 'Expand Map';
+    }}
+
+    // Trigger map resize after transition
+    setTimeout(() => {{
+        map.resize();
+    }}, 350);
+}}
 """
 
     def _track_to_geojson(self, track: dict) -> dict:
