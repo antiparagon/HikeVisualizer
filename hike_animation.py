@@ -15,7 +15,7 @@ import logging
 import math
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -133,17 +133,19 @@ def process_hike_data(files: dict, title: Optional[str], verbose: bool) -> HikeD
     for track in parsed_tracks[1:]:
         hike_data.trackpoints.extend(track["data"].trackpoints)
 
-    if len(parsed_tracks) > 1:
+    # Sort all trackpoints by timestamp to ensure time-order traversal
+    hike_data.trackpoints.sort(key=lambda tp: tp.timestamp if tp.timestamp else min_dt)
+
+    # Recalculate distances and stats after sort
+    if len(hike_data.trackpoints) > 1:
         _recalculate_distances(hike_data)
-        # Recalculate elevation stats
-        elevations = [tp.elevation for tp in hike_data.trackpoints]
-        hike_data.elevation_stats = hike_data.elevation_stats  # keep existing from first parse
-        if hike_data.trackpoints:
-            hike_data.start_time = hike_data.trackpoints[0].timestamp
-            hike_data.end_time = hike_data.trackpoints[-1].timestamp
-            if hike_data.start_time and hike_data.end_time:
-                hike_data.duration = hike_data.end_time - hike_data.start_time
-            hike_data.total_distance = hike_data.trackpoints[-1].distance_from_start
+    hike_data.elevation_stats = hike_data.elevation_stats  # keep existing from first parse
+    if hike_data.trackpoints:
+        hike_data.start_time = hike_data.trackpoints[0].timestamp
+        hike_data.end_time = hike_data.trackpoints[-1].timestamp
+        if hike_data.start_time and hike_data.end_time:
+            hike_data.duration = hike_data.end_time - hike_data.start_time
+        hike_data.total_distance = hike_data.trackpoints[-1].distance_from_start
 
     if title:
         hike_data.name = title
@@ -179,6 +181,17 @@ def process_hike_data(files: dict, title: Optional[str], verbose: bool) -> HikeD
 # Coordinate conversion
 # ---------------------------------------------------------------------------
 
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine distance between two lat/lon points, in miles."""
+    R = 3958.8  # Earth radius in miles
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
+
+
 def _smooth_array(values: List[float], window: int) -> List[float]:
     """Apply moving-average smoothing with the given window size."""
     if len(values) <= window:
@@ -211,7 +224,7 @@ def convert_to_local_xyz(hike_data: HikeData, vertical_exaggeration: float = 2.0
     raw_x, raw_y, raw_z = [], [], []
     for tp in tps:
         raw_x.append((tp.longitude - center_lon) * math.cos(center_lat_rad) * 111320)
-        raw_z.append((tp.latitude - center_lat) * 110540)
+        raw_z.append(-(tp.latitude - center_lat) * 110540)
         raw_y.append((tp.elevation - min_elev) * vertical_exaggeration)
 
     # Light smoothing for the display trail (removes GPS jitter but keeps shape)
@@ -226,8 +239,29 @@ def convert_to_local_xyz(hike_data: HikeData, vertical_exaggeration: float = 2.0
     cy = _smooth_array(raw_y, cam_window)
     cz = _smooth_array(raw_z, cam_window)
 
+    # Compute running stats (cumulative distance, ascent, descent, elapsed time)
+    cum_dist = 0.0   # miles
+    cum_ascent = 0.0  # feet
+    cum_descent = 0.0  # feet
+    start_time = tps[0].timestamp if tps[0].timestamp else None
+
     points = []
     for i in range(len(tps)):
+        if i > 0:
+            cum_dist += _haversine_miles(
+                tps[i - 1].latitude, tps[i - 1].longitude,
+                tps[i].latitude, tps[i].longitude,
+            )
+            elev_change_ft = (tps[i].elevation - tps[i - 1].elevation) * 3.28084
+            if elev_change_ft > 0:
+                cum_ascent += elev_change_ft
+            else:
+                cum_descent += abs(elev_change_ft)
+
+        elapsed = 0
+        if start_time and tps[i].timestamp:
+            elapsed = int((tps[i].timestamp - start_time).total_seconds())
+
         points.append({
             "x": round(sx[i], 2),
             "y": round(sy[i], 2),
@@ -238,6 +272,11 @@ def convert_to_local_xyz(hike_data: HikeData, vertical_exaggeration: float = 2.0
             "cz": round(cz[i], 2),
             "hr_color": tps[i].hr_color,
             "elevation": tps[i].elevation,
+            # Running stats
+            "cumDist": round(cum_dist, 2),
+            "cumAscent": round(cum_ascent),
+            "cumDescent": round(cum_descent),
+            "elapsed": elapsed,
         })
 
     return points
@@ -284,62 +323,128 @@ def _lerp_color(c1: str, c2: str, t: float) -> str:
 # Media data preparation
 # ---------------------------------------------------------------------------
 
-def prepare_media_data(hike_data: HikeData, xyz_points: List[dict]) -> List[dict]:
-    """Build media marker data with 3D positions."""
-    media_data = []
+def _image_to_base64(file_path: str, max_size: int = 256) -> Optional[str]:
+    """Read an image, resize to max_size, return as base64 data URL."""
+    try:
+        from PIL import Image as PILImage
+        src = Path(file_path)
+        ext = src.suffix.lower()
+
+        if ext in {".heic", ".heif"}:
+            try:
+                from pillow_heif import register_heif_opener
+                register_heif_opener()
+            except ImportError:
+                return None
+
+        with PILImage.open(src) as img:
+            rgb = img.convert("RGB") if img.mode != "RGB" else img
+            rgb.thumbnail((max_size, max_size), PILImage.LANCZOS)
+            import io, base64
+            buf = io.BytesIO()
+            rgb.save(buf, "JPEG", quality=70)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/jpeg;base64,{b64}"
+    except Exception:
+        return None
+
+
+def prepare_media_data(hike_data: HikeData, xyz_points: List[dict]) -> dict:
+    """Build media marker data: trail-matched and unmatched (wall) media.
+
+    A media item is placed on the trail ONLY if:
+      1. It has a real EXIF/metadata timestamp (not file mtime)
+      2. That timestamp falls within the hike's actual time window (± 5 min buffer)
+      3. DataMerger found a matching trackpoint
+
+    Everything else goes on the gallery walls.
+    """
+    trail_media = []
+    wall_media = []
+
+    # Hike time window with small buffer for photos taken just before/after
+    buffer = timedelta(minutes=5)
+    hike_start = hike_data.start_time - buffer if hike_data.start_time else None
+    hike_end = hike_data.end_time + buffer if hike_data.end_time else None
+
     for media in hike_data.media_items:
-        idx = media.nearest_trackpoint_index
-        if idx is None or idx >= len(xyz_points):
-            continue
-        pt = xyz_points[idx]
-        media_data.append({
-            "x": pt["x"],
-            "y": pt["y"],
-            "z": pt["z"],
-            "trackpoint_index": idx,
+        thumb_b64 = None
+        if media.media_type.value == "photo":
+            thumb_b64 = _image_to_base64(media.file_path)
+
+        entry = {
             "filename": media.filename,
             "output_filename": media.output_filename,
             "media_type": media.media_type.value,
             "is_360": media.is_360,
             "duration": media.duration_seconds,
-        })
-    return media_data
+            "thumb_b64": thumb_b64,
+        }
+
+        idx = media.nearest_trackpoint_index
+        # Check timestamp falls within the actual hike time range
+        in_hike_window = (
+            media.has_exif_timestamp
+            and hike_start is not None
+            and hike_end is not None
+            and hike_start <= media.timestamp <= hike_end
+        )
+
+        if idx is not None and idx < len(xyz_points) and in_hike_window:
+            pt = xyz_points[idx]
+            entry.update({"x": pt["x"], "y": pt["y"], "z": pt["z"], "trackpoint_index": idx})
+            trail_media.append(entry)
+        else:
+            wall_media.append(entry)
+
+    return {"trail": trail_media, "wall": wall_media}
 
 
 # ---------------------------------------------------------------------------
 # Media asset copying
 # ---------------------------------------------------------------------------
 
-def copy_media_assets(hike_data: HikeData, output_dir: Path) -> None:
+def copy_media_assets(hike_data: HikeData, output_dir: Path, max_texture_size: int = 512) -> None:
+    """Copy media assets, resizing images to max_texture_size for GPU performance."""
     assets_dir = output_dir / "assets"
     assets_dir.mkdir(exist_ok=True)
 
     for media in hike_data.media_items:
-        if media.nearest_trackpoint_index is None:
-            continue
         src = Path(media.file_path)
         dst = assets_dir / media.output_filename
         try:
             src_ext = src.suffix.lower()
             if src_ext in {".heic", ".heif"}:
-                _convert_heic(src, dst)
+                _convert_heic(src, dst, max_texture_size)
+            elif src_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                _resize_image(src, dst, max_texture_size)
             else:
                 shutil.copy2(src, dst)
         except Exception as e:
             logger.warning(f"Could not copy {src.name}: {e}")
 
 
-def _convert_heic(src: Path, dst: Path) -> None:
+def _resize_image(src: Path, dst: Path, max_size: int) -> None:
+    """Resize image so longest side is max_size, preserving aspect ratio."""
+    from PIL import Image
+    with Image.open(src) as img:
+        rgb = img.convert("RGB") if img.mode != "RGB" else img
+        rgb.thumbnail((max_size, max_size), Image.LANCZOS)
+        out_ext = dst.suffix.lower()
+        if out_ext == ".png":
+            rgb.save(dst, "PNG", optimize=True)
+        else:
+            rgb.save(dst, "JPEG", quality=80)
+
+
+def _convert_heic(src: Path, dst: Path, max_size: int = 512) -> None:
     from PIL import Image
     from pillow_heif import register_heif_opener
     register_heif_opener()
     with Image.open(src) as img:
         rgb = img.convert("RGB") if img.mode != "RGB" else img
-        exif_data = img.info.get("exif")
-        save_kwargs = {"quality": 92}
-        if exif_data:
-            save_kwargs["exif"] = exif_data
-        rgb.save(dst, "JPEG", **save_kwargs)
+        rgb.thumbnail((max_size, max_size), Image.LANCZOS)
+        rgb.save(dst, "JPEG", quality=80)
 
 
 # ---------------------------------------------------------------------------
@@ -350,13 +455,16 @@ def generate_html(
     hike_data: HikeData,
     xyz_points: List[dict],
     trail_colors: dict,
-    media_data: List[dict],
+    media_data: dict,
     config: dict,
 ) -> str:
     """Generate the complete self-contained HTML file."""
     # Prepare data for JSON embedding
     # Trail points (smoothed display path) and camera points (heavily smoothed)
-    js_points = [{"x": p["x"], "y": p["y"], "z": p["z"]} for p in xyz_points]
+    js_points = [{"x": p["x"], "y": p["y"], "z": p["z"],
+                  "cumDist": p["cumDist"], "cumAscent": p["cumAscent"],
+                  "cumDescent": p["cumDescent"], "elapsed": p["elapsed"]}
+                 for p in xyz_points]
     cam_points = [{"x": p["cx"], "y": p["cy"], "z": p["cz"]} for p in xyz_points]
 
     trail_data = json.dumps(js_points)
@@ -442,6 +550,15 @@ body{overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Rob
 }
 .btn-group button:hover{color:#fff;background:rgba(255,255,255,0.1)}
 .btn-group button.active{background:rgba(255,255,255,0.2);color:#fff}
+.toggle-row{
+  display:flex;align-items:center;gap:8px;
+  background:rgba(0,0,0,0.6);backdrop-filter:blur(10px);
+  border-radius:8px;padding:5px 10px;font-size:11px;color:rgba(255,255,255,0.7);
+}
+.toggle-row label{cursor:pointer;display:flex;align-items:center;gap:6px;white-space:nowrap}
+.toggle-row input[type="checkbox"]{accent-color:#e8772e;cursor:pointer}
+.toggle-row input[type="number"]{width:40px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);border-radius:4px;color:#fff;padding:2px 4px;font-size:11px;text-align:center}
+.toggle-row .delay-group{display:flex;align-items:center;gap:4px;margin-left:4px}
 
 /* Top-left info */
 #info-panel{
@@ -495,6 +612,15 @@ body{overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Rob
     <div class="info-stat"><span id="stat-dur"></span>duration</div>
     <div class="info-stat"><span id="stat-elev"></span>ft gain</div>
   </div>
+  <div id="running-stats" style="display:none;margin-top:10px;border-top:1px solid rgba(255,255,255,0.15);padding-top:10px">
+    <div style="font-size:11px;opacity:0.5;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Progress</div>
+    <div class="info-stats">
+      <div class="info-stat"><span id="run-dist">0.0</span>mi traveled</div>
+      <div class="info-stat"><span id="run-ascent">0</span>ft ascent</div>
+      <div class="info-stat"><span id="run-descent">0</span>ft descent</div>
+      <div class="info-stat"><span id="run-time">0:00</span>elapsed</div>
+    </div>
+  </div>
 </div>
 
 <!-- Settings -->
@@ -514,6 +640,13 @@ body{overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Rob
     <button data-color="hr" class="active">HR Zones</button>
     <button data-color="elevation">Elevation</button>
     <button data-color="solid">Solid</button>
+  </div>
+  <div class="toggle-row">
+    <label><input type="checkbox" id="auto-media"> Auto-show media</label>
+    <div class="delay-group">
+      <input type="number" id="auto-media-delay" value="3" min="1" max="30" step="1">
+      <span>sec</span>
+    </div>
   </div>
 </div>
 
@@ -553,7 +686,9 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 const TRAIL_POINTS = __TRAIL_DATA__;
 const CAM_POINTS = __CAM_DATA__;
 const TRAIL_COLORS = __COLOR_DATA__;
-const MEDIA_MARKERS = __MEDIA_DATA__;
+const MEDIA_DATA = __MEDIA_DATA__;
+const MEDIA_MARKERS = MEDIA_DATA.trail || [];
+const WALL_MEDIA = MEDIA_DATA.wall || [];
 const HIKE_META = __HIKE_META__;
 const CONFIG = __CONFIG__;
 
@@ -587,11 +722,9 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100000);
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.6;
+renderer.setPixelRatio(1);
+renderer.shadowMap.enabled = false;
+renderer.toneMapping = THREE.NoToneMapping;
 document.getElementById('canvas-container').appendChild(renderer.domElement);
 
 // CSS2D renderer for labels
@@ -647,6 +780,59 @@ const trailCenter = new THREE.Vector3();
 trailBBox.getCenter(trailCenter);
 const maxExtent = Math.max(trailSize.x, trailSize.z, 100);
 
+// === SCULPTURE MODE: float trail inside room, never intersecting walls/floor/ceiling ===
+
+// Room dimensions — sized from the original trail footprint
+const roomPadding = 1.6;
+const roomWidth = maxExtent * roomPadding;
+const roomDepth = maxExtent * roomPadding;
+const roomFloorY = 0;
+
+// Margins: trail must stay this far from any room surface
+const margin = maxExtent * 0.04;
+
+// Lift trail so its lowest point sits at floor + margin
+const minY = Math.min(...curvePoints.map(p => p.y));
+const yLift = (roomFloorY + margin) - minY;
+curvePoints.forEach(p => { p.y += yLift; });
+camCurvePoints.forEach(p => { p.y += yLift; });
+
+// Recalculate bounding box after lift
+trailBBox.makeEmpty();
+curvePoints.forEach(p => trailBBox.expandByPoint(p));
+trailBBox.getSize(trailSize);
+trailBBox.getCenter(trailCenter);
+
+// Room height must accommodate the lifted trail with margin above
+const roomHeight = Math.max(trailBBox.max.y + margin * 2, maxExtent * 0.7);
+const roomCeilY = roomFloorY + roomHeight;
+
+// Clamp all trail points so they never breach floor, ceiling, or walls
+const hw = roomWidth / 2;
+const hd = roomDepth / 2;
+const cx = trailCenter.x;
+const cz = trailCenter.z;
+
+function clampPoint(p) {
+    p.y = Math.max(roomFloorY + margin, Math.min(roomCeilY - margin, p.y));
+    p.x = Math.max(cx - hw + margin, Math.min(cx + hw - margin, p.x));
+    p.z = Math.max(cz - hd + margin, Math.min(cz + hd - margin, p.z));
+}
+curvePoints.forEach(clampPoint);
+camCurvePoints.forEach(clampPoint);
+
+// Rebuild curves with final clamped points
+trailCurve.points = downsample(curvePoints, 2000);
+trailCurve.updateArcLengths();
+cameraCurve.points = downsample(camCurvePoints, 2000);
+cameraCurve.updateArcLengths();
+
+// Final bounding box
+trailBBox.makeEmpty();
+curvePoints.forEach(p => trailBBox.expandByPoint(p));
+trailBBox.getSize(trailSize);
+trailBBox.getCenter(trailCenter);
+
 // === TRAIL MESH ===
 let trailMesh = null;
 let trailLine = null;
@@ -690,8 +876,8 @@ function createTrailGeometry(style, colorMode) {
     } else {
         // Tube geometry
         const radius = style === 'realistic' ? maxExtent * 0.003 : maxExtent * 0.002;
-        const tubularSegments = numSamples;
-        const radialSegments = 8;
+        const tubularSegments = Math.min(numSamples, 500);
+        const radialSegments = 6;
         const geom = new THREE.TubeGeometry(trailCurve, tubularSegments, radius, radialSegments, false);
 
         // Apply vertex colors - each ring of radialSegments+1 gets the same color
@@ -716,27 +902,24 @@ function createTrailGeometry(style, colorMode) {
         }
 
         geom.setAttribute('color', new THREE.Float32BufferAttribute(colorArr, 3));
-        const mat = new THREE.MeshStandardMaterial({
-            vertexColors: true, roughness: 0.5, metalness: 0.1,
-        });
+        const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
         trailMesh = new THREE.Mesh(geom, mat);
-        trailMesh.castShadow = true;
+    
         scene.add(trailMesh);
     }
 }
 
 // === HIKER SPHERE ===
 const hikerRadius = maxExtent * 0.006;
-const hikerGeom = new THREE.SphereGeometry(hikerRadius, 20, 20);
-const hikerMat = new THREE.MeshStandardMaterial({
+const hikerGeom = new THREE.SphereGeometry(hikerRadius, 12, 12);
+const hikerMat = new THREE.MeshLambertMaterial({
     color: 0xff6b35, emissive: 0xff6b35, emissiveIntensity: 0.4,
 });
 const hiker = new THREE.Mesh(hikerGeom, hikerMat);
-hiker.castShadow = true;
 scene.add(hiker);
 
 // Hiker glow
-const glowGeom = new THREE.SphereGeometry(hikerRadius * 2, 16, 16);
+const glowGeom = new THREE.SphereGeometry(hikerRadius * 2, 8, 8);
 const glowMat = new THREE.MeshBasicMaterial({
     color: 0xff6b35, transparent: true, opacity: 0.15,
 });
@@ -759,41 +942,161 @@ function updateHikerPosition(t, dt) {
     hikerGlow.position.copy(hikerSmoothedPos);
 }
 
-// === GROUND PLANE (dark gallery floor) ===
-let ground = null;
+// === MUSEUM ROOM ===
+const roomGroup = new THREE.Group();
+scene.add(roomGroup);
 let gridHelper = null;
 
-function createGround(style) {
-    if (ground) { scene.remove(ground); ground.geometry.dispose(); ground = null; }
+function createRoom(style) {
+    // Clear previous room
+    while (roomGroup.children.length > 0) {
+        const child = roomGroup.children[0];
+        roomGroup.remove(child);
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+    }
     if (gridHelper) { scene.remove(gridHelper); gridHelper = null; }
 
-    const size = maxExtent * 4;
-    const floorColor = style === 'minimal' ? 0x686868 : style === 'topographic' ? 0x707070 : 0x585858;
+    const cx = trailCenter.x;
+    const cz = trailCenter.z;
+    const hw = roomWidth / 2;
+    const hd = roomDepth / 2;
 
+    const floorColor = style === 'minimal' ? 0x999999 : style === 'topographic' ? 0x9a9a9a : 0x8a8a8a;
+    const wallColor = style === 'minimal' ? 0xc0c0c0 : style === 'topographic' ? 0xbbbbbb : 0xb0b0b0;
+    const ceilColor = style === 'minimal' ? 0xd0d0d0 : style === 'topographic' ? 0xcccccc : 0xc5c5c5;
+
+    // Grid on floor for minimal/topo styles
     if (style === 'minimal') {
-        gridHelper = new THREE.GridHelper(size, 60, 0x888888, 0x777777);
-        gridHelper.position.y = -1;
-        gridHelper.position.x = trailCenter.x;
-        gridHelper.position.z = trailCenter.z;
+        gridHelper = new THREE.GridHelper(Math.max(roomWidth, roomDepth), 60, 0x888888, 0x777777);
+        gridHelper.position.set(cx, roomFloorY + 0.1, cz);
         scene.add(gridHelper);
     } else if (style === 'topographic') {
-        gridHelper = new THREE.GridHelper(size, 80, 0x888888, 0x787878);
-        gridHelper.position.y = -1;
-        gridHelper.position.x = trailCenter.x;
-        gridHelper.position.z = trailCenter.z;
+        gridHelper = new THREE.GridHelper(Math.max(roomWidth, roomDepth), 80, 0x888888, 0x787878);
+        gridHelper.position.set(cx, roomFloorY + 0.1, cz);
         scene.add(gridHelper);
     }
 
-    // Gallery floor for all styles
-    const geom = new THREE.PlaneGeometry(size, size);
-    geom.rotateX(-Math.PI / 2);
-    const mat = new THREE.MeshStandardMaterial({
-        color: floorColor, roughness: 0.35, metalness: 0.05,
+    // --- Floor ---
+    const floorGeom = new THREE.PlaneGeometry(roomWidth * 1.2, roomDepth * 1.2);
+    floorGeom.rotateX(-Math.PI / 2);
+    const floorMat = new THREE.MeshLambertMaterial({ color: floorColor });
+    const floor = new THREE.Mesh(floorGeom, floorMat);
+    floor.position.set(cx, roomFloorY, cz);
+    roomGroup.add(floor);
+
+    // --- Ceiling (shaded: darker at edges) ---
+    const ceilSegs = 4;
+    const ceilGeom = new THREE.PlaneGeometry(roomWidth * 1.2, roomDepth * 1.2, ceilSegs, ceilSegs);
+    ceilGeom.rotateX(Math.PI / 2);
+    // Vertex shading: darken toward edges
+    const ceilPosAttr = ceilGeom.attributes.position;
+    const ceilColors = [];
+    const ceilBase = new THREE.Color(ceilColor);
+    const ceilEdge = new THREE.Color(ceilColor).multiplyScalar(0.55);
+    for (let i = 0; i < ceilPosAttr.count; i++) {
+        const x = ceilPosAttr.getX(i);
+        const z = ceilPosAttr.getZ(i);
+        const edgeFactor = Math.max(
+            Math.abs(x) / (roomWidth * 0.6),
+            Math.abs(z) / (roomDepth * 0.6)
+        );
+        const t = Math.min(1, edgeFactor);
+        const c = ceilBase.clone().lerp(ceilEdge, t);
+        ceilColors.push(c.r, c.g, c.b);
+    }
+    ceilGeom.setAttribute('color', new THREE.Float32BufferAttribute(ceilColors, 3));
+    const ceilMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+    const ceil = new THREE.Mesh(ceilGeom, ceilMat);
+    ceil.position.set(cx, roomCeilY, cz);
+    roomGroup.add(ceil);
+
+    // --- Helper: create a shaded wall (darker at top/bottom edges and side edges) ---
+    function createShadedWall(w, h, segsW, segsH) {
+        const geom = new THREE.PlaneGeometry(w, h, segsW || 4, segsH || 4);
+        const posAttr = geom.attributes.position;
+        const colors = [];
+        const wBase = new THREE.Color(wallColor);
+        const wEdge = new THREE.Color(wallColor).multiplyScalar(0.5);
+        for (let i = 0; i < posAttr.count; i++) {
+            const lx = posAttr.getX(i);
+            const ly = posAttr.getY(i);
+            const edgeX = Math.abs(lx) / (w * 0.5);
+            const edgeY = Math.abs(ly) / (h * 0.5);
+            const t = Math.min(1, Math.max(edgeX * 0.5, edgeY * 0.7));
+            const c = wBase.clone().lerp(wEdge, t);
+            colors.push(c.r, c.g, c.b);
+        }
+        geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        const mat = new THREE.MeshLambertMaterial({
+            vertexColors: true, side: THREE.DoubleSide,
+        });
+        return new THREE.Mesh(geom, mat);
+    }
+
+    // Back wall (-Z)
+    const backWall = createShadedWall(roomWidth * 1.2, roomHeight);
+    backWall.position.set(cx, roomFloorY + roomHeight / 2, cz - hd);
+    roomGroup.add(backWall);
+
+    // Front wall (+Z)
+    const frontWall = createShadedWall(roomWidth * 1.2, roomHeight);
+    frontWall.position.set(cx, roomFloorY + roomHeight / 2, cz + hd);
+    frontWall.rotation.y = Math.PI;
+    roomGroup.add(frontWall);
+
+    // Left wall (-X)
+    const leftWall = createShadedWall(roomDepth * 1.2, roomHeight);
+    leftWall.position.set(cx - hw, roomFloorY + roomHeight / 2, cz);
+    leftWall.rotation.y = Math.PI / 2;
+    roomGroup.add(leftWall);
+
+    // Right wall (+X)
+    const rightWall = createShadedWall(roomDepth * 1.2, roomHeight);
+    rightWall.position.set(cx + hw, roomFloorY + roomHeight / 2, cz);
+    rightWall.rotation.y = -Math.PI / 2;
+    roomGroup.add(rightWall);
+
+    // --- Edge lines at wall/ceiling and wall/floor junctions ---
+    // Offset lines slightly inward so they don't z-fight with surfaces
+    const edgeColor = 0x888888;
+    const edgeMat = new THREE.LineBasicMaterial({ color: edgeColor });
+    const eo = maxExtent * 0.01; // edge offset inward from surfaces
+
+    // Floor edges (4 lines) — lifted slightly above floor
+    const fy = roomFloorY + eo;
+    const floorEdges = [
+        [[-hw + eo, fy, -hd + eo], [ hw - eo, fy, -hd + eo]],
+        [[ hw - eo, fy, -hd + eo], [ hw - eo, fy,  hd - eo]],
+        [[ hw - eo, fy,  hd - eo], [-hw + eo, fy,  hd - eo]],
+        [[-hw + eo, fy,  hd - eo], [-hw + eo, fy, -hd + eo]],
+    ];
+    // Ceiling edges (4 lines) — lowered slightly below ceiling
+    const cy2 = roomCeilY - eo;
+    const ceilEdges = [
+        [[-hw + eo, cy2, -hd + eo], [ hw - eo, cy2, -hd + eo]],
+        [[ hw - eo, cy2, -hd + eo], [ hw - eo, cy2,  hd - eo]],
+        [[ hw - eo, cy2,  hd - eo], [-hw + eo, cy2,  hd - eo]],
+        [[-hw + eo, cy2,  hd - eo], [-hw + eo, cy2, -hd + eo]],
+    ];
+    // Vertical corner edges (4 lines) — inset from both walls at each corner
+    const vertEdges = [
+        [[-hw + eo, fy, -hd + eo], [-hw + eo, cy2, -hd + eo]],
+        [[ hw - eo, fy, -hd + eo], [ hw - eo, cy2, -hd + eo]],
+        [[ hw - eo, fy,  hd - eo], [ hw - eo, cy2,  hd - eo]],
+        [[-hw + eo, fy,  hd - eo], [-hw + eo, cy2,  hd - eo]],
+    ];
+
+    [...floorEdges, ...ceilEdges, ...vertEdges].forEach(([a, b]) => {
+        const pts = [
+            new THREE.Vector3(cx + a[0], a[1], cz + a[2]),
+            new THREE.Vector3(cx + b[0], b[1], cz + b[2]),
+        ];
+        const lineGeom = new THREE.BufferGeometry().setFromPoints(pts);
+        const line = new THREE.Line(lineGeom, edgeMat);
+        roomGroup.add(line);
     });
-    ground = new THREE.Mesh(geom, mat);
-    ground.position.set(trailCenter.x, -2, trailCenter.z);
-    ground.receiveShadow = true;
-    scene.add(ground);
+
 }
 
 // === LIGHTING (gallery / museum ambience) ===
@@ -803,51 +1106,82 @@ function setupLighting(style) {
     lights.forEach(l => scene.remove(l));
     lights = [];
 
-    if (style === 'minimal') {
-        scene.background = new THREE.Color(0x4a4a4a);
-        const ambient = new THREE.AmbientLight(0xffffff, 0.9);
-        const dir = new THREE.DirectionalLight(0xffffff, 0.7);
-        dir.position.set(maxExtent, maxExtent * 2, maxExtent);
-        lights.push(ambient, dir);
-        scene.add(ambient, dir);
-    } else if (style === 'topographic') {
-        scene.background = new THREE.Color(0x454545);
-        const ambient = new THREE.AmbientLight(0xfff8f0, 0.8);
-        const dir = new THREE.DirectionalLight(0xfff5e6, 0.9);
-        dir.position.set(maxExtent, maxExtent * 2, maxExtent * 0.5);
-        dir.castShadow = true;
-        dir.shadow.mapSize.width = 2048;
-        dir.shadow.mapSize.height = 2048;
-        lights.push(ambient, dir);
-        scene.add(ambient, dir);
-    } else {
-        // Realistic — museum lighting (bright gallery)
-        scene.background = new THREE.Color(0x3e3e3e);
-        const hemi = new THREE.HemisphereLight(0x444466, 0x333333, 0.7);
-        const sun = new THREE.DirectionalLight(0xfff5e6, 1.2);
-        sun.position.set(maxExtent * 0.5, maxExtent * 1.5, maxExtent * 0.8);
-        sun.castShadow = true;
-        sun.shadow.mapSize.width = 2048;
-        sun.shadow.mapSize.height = 2048;
-        const shadowSize = maxExtent * 2;
-        sun.shadow.camera.left = -shadowSize;
-        sun.shadow.camera.right = shadowSize;
-        sun.shadow.camera.top = shadowSize;
-        sun.shadow.camera.bottom = -shadowSize;
-        sun.shadow.camera.far = maxExtent * 5;
-        // Warm fill light from below (gallery floor bounce)
-        const fill = new THREE.DirectionalLight(0xffeedd, 0.35);
-        fill.position.set(0, -maxExtent, 0);
-        const ambient = new THREE.AmbientLight(0xfff8f0, 0.5);
-        lights.push(hemi, sun, fill, ambient);
-        scene.add(hemi, sun, fill, ambient);
-    }
+    // No sky background — we're inside a room
+    scene.background = null; // room walls provide the background
+
+    // Bright ambient fill for the whole room
+    const ambientIntensity = style === 'minimal' ? 1.2 : style === 'topographic' ? 1.1 : 1.0;
+    const ambient = new THREE.AmbientLight(0xffffff, ambientIntensity);
+    lights.push(ambient);
+    scene.add(ambient);
+
+    // Two ceiling spotlights on the sculpture (minimal draw calls)
+    const spotTarget = new THREE.Object3D();
+    spotTarget.position.copy(trailCenter);
+    scene.add(spotTarget);
+
+    const spotIntensity = style === 'minimal' ? 2.5 : 3.5;
+    const spot1 = new THREE.SpotLight(0xfff5e6, spotIntensity, roomHeight * 3, Math.PI / 4, 0.6, 1.0);
+    spot1.position.set(trailCenter.x, roomCeilY - 1, trailCenter.z);
+    spot1.target = spotTarget;
+    lights.push(spot1);
+    scene.add(spot1);
+
+    const spot2 = new THREE.SpotLight(0xfff5e6, spotIntensity * 0.6, roomHeight * 3, Math.PI / 4, 0.6, 1.0);
+    spot2.position.set(trailCenter.x + maxExtent * 0.3, roomCeilY - 1, trailCenter.z + maxExtent * 0.3);
+    spot2.target = spotTarget;
+    lights.push(spot2);
+    scene.add(spot2);
 }
 
-// === GALLERY MEDIA DISPLAYS ===
+// === MEDIA THUMBNAILS ===
 const mediaMarkerGroup = new THREE.Group();
+const wallMediaGroup = new THREE.Group();
 const markerMeshes = [];  // clickable meshes for raycaster
-const gallerySpotlights = [];
+
+// Helper: create material for a media item
+function makeMediaMaterial(media, doubleSide) {
+    const mat = new THREE.MeshBasicMaterial({
+        side: doubleSide ? THREE.DoubleSide : THREE.FrontSide,
+        depthWrite: false,
+    });
+    if (media.media_type === 'photo' && media.thumb_b64) {
+        const img = new Image();
+        const ref = mat;
+        img.onload = () => {
+            const texture = new THREE.Texture(img);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.needsUpdate = true;
+            ref.map = texture;
+            ref.needsUpdate = true;
+        };
+        img.src = media.thumb_b64;
+    } else if (media.media_type === 'video') {
+        const c = document.createElement('canvas');
+        c.width = 256; c.height = 192;
+        const x = c.getContext('2d');
+        x.fillStyle = '#1a1a2e'; x.fillRect(0, 0, 256, 192);
+        x.fillStyle = '#fff'; x.beginPath();
+        x.moveTo(100, 56); x.lineTo(100, 136); x.lineTo(170, 96);
+        x.closePath(); x.fill();
+        x.fillStyle = '#888'; x.font = '14px sans-serif';
+        x.textAlign = 'center'; x.fillText('VIDEO', 128, 176);
+        const tex = new THREE.CanvasTexture(c);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        mat.map = tex;
+    } else if (media.media_type === 'audio') {
+        const c = document.createElement('canvas');
+        c.width = 256; c.height = 192;
+        const x = c.getContext('2d');
+        x.fillStyle = '#1a1a2e'; x.fillRect(0, 0, 256, 192);
+        x.fillStyle = '#888'; x.font = '48px sans-serif';
+        x.textAlign = 'center'; x.fillText('\u266B', 128, 110);
+        x.font = '14px sans-serif'; x.fillText('AUDIO', 128, 150);
+        const tex = new THREE.CanvasTexture(c);
+        mat.map = tex;
+    }
+    return mat;
+}
 
 function createMediaMarkers() {
     // Clear existing
@@ -856,157 +1190,213 @@ function createMediaMarkers() {
         mediaMarkerGroup.remove(child);
         if (child.geometry) child.geometry.dispose();
     }
+    while (wallMediaGroup.children.length > 0) {
+        const child = wallMediaGroup.children[0];
+        wallMediaGroup.remove(child);
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) { if (child.material.map) child.material.map.dispose(); child.material.dispose(); }
+    }
     markerMeshes.length = 0;
-    gallerySpotlights.forEach(s => scene.remove(s));
-    gallerySpotlights.length = 0;
 
-    // Gallery sizing relative to trail scale
-    const frameW = maxExtent * 0.04;   // frame width
-    const frameH = frameW * 0.75;      // 4:3 aspect
-    const frameDepth = frameW * 0.03;  // thin frame
-    const wallW = frameW * 1.6;        // wall panel behind frame
-    const wallH = frameH * 1.8;
-    const wallDepth = frameDepth * 0.5;
-    const standoffDist = maxExtent * 0.06; // distance from trail
+    // --- Trail thumbnails (billboard, float above trail) ---
+    const thumbW = maxExtent * 0.035;
+    const thumbH = thumbW * 0.75;
+    const thumbOffset = maxExtent * 0.04;
+    const minSep = thumbW * 1.2; // min 3D distance before spreading
 
-    MEDIA_MARKERS.forEach((media, index) => {
-        const group = new THREE.Group();
-
-        // Determine wall position: offset perpendicular to trail direction
-        // Alternate sides for variety
+    // First pass: compute base positions above trail
+    const markerPositions = MEDIA_MARKERS.map((media) => {
         const t = media.trackpoint_index / Math.max(1, TRAIL_POINTS.length - 1);
         const trailPt = trailCurve.getPointAt(Math.max(0, Math.min(1, t)));
-        const tangent = getSmoothTangent(Math.max(0.001, Math.min(0.999, t)));
-        const up = new THREE.Vector3(0, 1, 0);
-        const perpendicular = new THREE.Vector3().crossVectors(tangent, up).normalize();
-        const side = (index % 2 === 0) ? 1 : -1;
-
-        // Wall position: next to trail, at a comfortable viewing height
-        const wallPos = trailPt.clone()
-            .add(perpendicular.clone().multiplyScalar(standoffDist * side));
-        wallPos.y = Math.max(trailPt.y, 0) + wallH * 0.5 + hikerRadius * 2;
-
-        // Face the wall toward the trail
-        const faceDir = trailPt.clone().sub(wallPos);
-        faceDir.y = 0;
-        faceDir.normalize();
-        const angle = Math.atan2(faceDir.x, faceDir.z);
-
-        // --- Wall panel (dark gallery wall) ---
-        const wallGeom = new THREE.BoxGeometry(wallW, wallH, wallDepth);
-        const wallMat = new THREE.MeshStandardMaterial({
-            color: 0x454545, roughness: 0.85, metalness: 0.0,
-        });
-        const wall = new THREE.Mesh(wallGeom, wallMat);
-        wall.castShadow = true;
-        wall.receiveShadow = true;
-        group.add(wall);
-
-        // --- Frame (elegant dark wood / black) ---
-        const frameBorder = frameW * 0.04;
-        const outerW = frameW + frameBorder * 2;
-        const outerH = frameH + frameBorder * 2;
-        const frameGeom = new THREE.BoxGeometry(outerW, outerH, frameDepth * 1.5);
-        const frameMat = new THREE.MeshStandardMaterial({
-            color: 0x1a1a1a, roughness: 0.3, metalness: 0.4,
-        });
-        const frame = new THREE.Mesh(frameGeom, frameMat);
-        frame.position.z = wallDepth * 0.5 + frameDepth * 0.5;
-        frame.castShadow = true;
-        group.add(frame);
-
-        // --- Photo/image plane (textured with the actual image) ---
-        const imgGeom = new THREE.PlaneGeometry(frameW, frameH);
-        let imgMat;
-        if (media.media_type === 'photo') {
-            const texture = new THREE.TextureLoader().load('assets/' + media.output_filename);
-            texture.colorSpace = THREE.SRGBColorSpace;
-            imgMat = new THREE.MeshStandardMaterial({
-                map: texture, roughness: 0.4, metalness: 0.0,
-            });
-        } else if (media.media_type === 'video') {
-            // Video thumbnail placeholder — dark with play icon
-            const canvas = document.createElement('canvas');
-            canvas.width = 256; canvas.height = 192;
-            const ctx = canvas.getContext('2d');
-            ctx.fillStyle = '#1a1a2e';
-            ctx.fillRect(0, 0, 256, 192);
-            // Play triangle
-            ctx.fillStyle = '#ffffff';
-            ctx.beginPath();
-            ctx.moveTo(100, 56); ctx.lineTo(100, 136); ctx.lineTo(170, 96);
-            ctx.closePath(); ctx.fill();
-            // Label
-            ctx.fillStyle = '#888';
-            ctx.font = '14px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.fillText('VIDEO', 128, 176);
-            const tex = new THREE.CanvasTexture(canvas);
-            tex.colorSpace = THREE.SRGBColorSpace;
-            imgMat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.4 });
-        } else {
-            // Audio placeholder
-            const canvas = document.createElement('canvas');
-            canvas.width = 256; canvas.height = 192;
-            const ctx = canvas.getContext('2d');
-            ctx.fillStyle = '#1a1a2e';
-            ctx.fillRect(0, 0, 256, 192);
-            ctx.fillStyle = '#888';
-            ctx.font = '48px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.fillText('\u266B', 128, 110);
-            ctx.font = '14px sans-serif';
-            ctx.fillText('AUDIO', 128, 150);
-            const tex = new THREE.CanvasTexture(canvas);
-            imgMat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.4 });
-        }
-        const imgPlane = new THREE.Mesh(imgGeom, imgMat);
-        imgPlane.position.z = wallDepth * 0.5 + frameDepth * 1.6;
-        imgPlane.userData = { mediaIndex: index, ...media };
-        group.add(imgPlane);
-        markerMeshes.push(imgPlane); // clickable
-
-        // --- Small label plaque beneath frame ---
-        const plaqueCanvas = document.createElement('canvas');
-        plaqueCanvas.width = 256; plaqueCanvas.height = 48;
-        const pCtx = plaqueCanvas.getContext('2d');
-        pCtx.fillStyle = '#c0a060';
-        pCtx.fillRect(0, 0, 256, 48);
-        pCtx.fillStyle = '#1a1a1a';
-        pCtx.font = 'bold 16px sans-serif';
-        pCtx.textAlign = 'center';
-        const label = media.filename.length > 28 ? media.filename.substring(0, 25) + '...' : media.filename;
-        pCtx.fillText(label, 128, 30);
-        const plaqueTex = new THREE.CanvasTexture(plaqueCanvas);
-        const plaqueGeom = new THREE.PlaneGeometry(frameW * 0.6, frameW * 0.08);
-        const plaqueMat = new THREE.MeshStandardMaterial({
-            map: plaqueTex, roughness: 0.3, metalness: 0.6,
-        });
-        const plaque = new THREE.Mesh(plaqueGeom, plaqueMat);
-        plaque.position.y = -(outerH * 0.5 + frameW * 0.06);
-        plaque.position.z = wallDepth * 0.5 + frameDepth * 0.5;
-        group.add(plaque);
-
-        // Position and orient the whole group
-        group.position.copy(wallPos);
-        group.rotation.y = angle;
-        mediaMarkerGroup.add(group);
-
-        // --- Gallery spotlight aimed at each frame ---
-        const spotTarget = new THREE.Object3D();
-        spotTarget.position.copy(wallPos);
-        scene.add(spotTarget);
-
-        const spot = new THREE.SpotLight(0xfff5e6, 3.5, maxExtent * 0.3, Math.PI / 8, 0.5, 1.5);
-        spot.position.copy(wallPos.clone().add(new THREE.Vector3(0, wallH * 1.0, 0))
-            .add(faceDir.clone().multiplyScalar(standoffDist * 0.5)));
-        spot.target = spotTarget;
-        spot.castShadow = false; // perf: skip shadow for spotlights
-        scene.add(spot);
-        gallerySpotlights.push(spot);
+        const pos = trailPt.clone();
+        pos.y += thumbOffset;
+        return pos;
     });
 
+    // Second pass: spread overlapping markers into a cloud around their base point
+    // Uses a spiral pattern in the xz plane + gentle y lift so clusters fan out
+    const spreadRadius = thumbW * 1.0;
+    for (let i = 0; i < markerPositions.length; i++) {
+        // Count how many earlier markers are too close (cluster detection)
+        let clusterPeers = [];
+        for (let j = 0; j < i; j++) {
+            const d = markerPositions[i].distanceTo(markerPositions[j]);
+            if (d < minSep) clusterPeers.push(j);
+        }
+        if (clusterPeers.length > 0) {
+            // This marker's slot in the cluster (1-based, 0 is the first marker which stays put)
+            const slot = clusterPeers.length;
+            // Golden angle spiral for even distribution
+            const angle = slot * 2.399963; // golden angle in radians
+            const ring = Math.ceil(slot / 6); // which ring (1, 2, ...)
+            const r = spreadRadius * ring;
+            markerPositions[i].x += Math.cos(angle) * r;
+            markerPositions[i].z += Math.sin(angle) * r;
+            markerPositions[i].y += thumbH * 0.4 * ring; // gentle lift per ring
+        }
+    }
+
+    // Third pass: create meshes at final positions
+    MEDIA_MARKERS.forEach((media, index) => {
+        const geom = new THREE.PlaneGeometry(thumbW, thumbH);
+        const mat = makeMediaMaterial(media, true);
+        const thumb = new THREE.Mesh(geom, mat);
+        thumb.position.copy(markerPositions[index]);
+        thumb.userData = { mediaIndex: index, ...media };
+        mediaMarkerGroup.add(thumb);
+        markerMeshes.push(thumb);
+    });
+
+    // --- Wall media (unmatched — displayed as framed paintings, art gallery style) ---
+    // Uses a SINGLE canvas per painting (frame + mat + image composited together)
+    // to completely eliminate z-fighting between overlapping planes.
+    if (WALL_MEDIA.length > 0) {
+        const wcx = trailCenter.x;
+        const wcz = trailCenter.z;
+        const whw = roomWidth / 2;
+        const whd = roomDepth / 2;
+        const wallInset = maxExtent * 0.03;
+
+        // World-space painting size
+        const paintingWorldH = roomHeight * 0.35;
+        const paintingWorldW = paintingWorldH * 1.25; // landscape-ish
+
+        // Canvas pixel dimensions (single texture)
+        const canvasW = 512;
+        const canvasH = Math.round(canvasW / 1.25);
+        // Proportions within canvas (pixels)
+        const framePx = 16;   // outer frame border
+        const matPx = 24;     // mat border
+        const imgL = framePx + matPx;
+        const imgT = framePx + matPx;
+        const imgW = canvasW - imgL * 2;
+        const imgH = canvasH - imgT * 2;
+        // Plaque area below image inside frame
+        const plaqueTop = canvasH - framePx - matPx + 2;
+
+        // Determine how many paintings per wall, adapting sizes
+        const perWall = [];
+        for (let w = 0; w < 4; w++) perWall.push([]);
+        WALL_MEDIA.forEach((media, i) => perWall[i % 4].push({ media, globalIdx: i }));
+
+        // Wall definitions
+        const wallDefs = [
+            { span: roomWidth, fixedAxis: 'z', fixedVal: wcz - whd + wallInset, varAxis: 'x', center: wcx, rot: 0 },
+            { span: roomDepth, fixedAxis: 'x', fixedVal: wcx + whw - wallInset, varAxis: 'z', center: wcz, rot: -Math.PI / 2 },
+            { span: roomWidth, fixedAxis: 'z', fixedVal: wcz + whd - wallInset, varAxis: 'x', center: wcx, rot: Math.PI },
+            { span: roomDepth, fixedAxis: 'x', fixedVal: wcx - whw + wallInset, varAxis: 'z', center: wcz, rot: Math.PI / 2 },
+        ];
+
+        wallDefs.forEach((wallDef, wallIdx) => {
+            const items = perWall[wallIdx];
+            if (items.length === 0) return;
+
+            // Scale paintings to fit wall: leave 10% gaps on each end, equal spacing
+            const usableSpan = wallDef.span * 0.8;
+            const maxPaintW = usableSpan / items.length * 0.85;
+            const pw = Math.min(paintingWorldW, maxPaintW);
+            const ph = pw / 1.25;
+
+            items.forEach((item, posIdx) => {
+                const { media, globalIdx } = item;
+                const t = (posIdx + 0.5) / items.length; // 0..1 along wall
+                const offset = (t - 0.5) * usableSpan;
+
+                const pos3 = new THREE.Vector3();
+                if (wallDef.varAxis === 'x') {
+                    const sign = (wallDef.rot === Math.PI) ? -1 : 1;
+                    pos3.x = wallDef.center + offset * sign;
+                    pos3.z = wallDef.fixedVal;
+                } else {
+                    const sign = (wallDef.rot === Math.PI / 2) ? -1 : 1;
+                    pos3.z = wallDef.center + offset * sign;
+                    pos3.x = wallDef.fixedVal;
+                }
+                pos3.y = roomFloorY + roomHeight * 0.45;
+
+                // Build a single canvas: frame → mat → image placeholder
+                const c = document.createElement('canvas');
+                c.width = canvasW; c.height = canvasH;
+                const ctx = c.getContext('2d');
+
+                // Frame (dark wood)
+                ctx.fillStyle = '#2a1a0a';
+                ctx.fillRect(0, 0, canvasW, canvasH);
+
+                // Mat (off-white)
+                ctx.fillStyle = '#f5f0e8';
+                ctx.fillRect(framePx, framePx, canvasW - framePx * 2, canvasH - framePx * 2);
+
+                // Image area placeholder (gray until image loads)
+                ctx.fillStyle = '#888888';
+                ctx.fillRect(imgL, imgT, imgW, imgH);
+
+                // Plaque text at bottom of mat
+                ctx.fillStyle = '#c8b888';
+                const plH = 20;
+                const plW2 = imgW * 0.6;
+                const plX = (canvasW - plW2) / 2;
+                ctx.fillRect(plX, canvasH - framePx - plH - 4, plW2, plH);
+                ctx.fillStyle = '#2a1a0a';
+                ctx.font = '11px serif';
+                ctx.textAlign = 'center';
+                let label = media.filename || '';
+                if (label.length > 30) label = label.substring(0, 27) + '...';
+                ctx.fillText(label, canvasW / 2, canvasH - framePx - 8);
+
+                const tex = new THREE.CanvasTexture(c);
+                tex.colorSpace = THREE.SRGBColorSpace;
+
+                // If photo, load the image into the canvas image area
+                if (media.media_type === 'photo' && media.thumb_b64) {
+                    const img = new window.Image();
+                    img.onload = () => {
+                        ctx.drawImage(img, imgL, imgT, imgW, imgH);
+                        tex.needsUpdate = true;
+                    };
+                    img.src = media.thumb_b64;
+                } else if (media.media_type === 'video') {
+                    // Draw video icon in image area
+                    ctx.fillStyle = '#1a1a2e';
+                    ctx.fillRect(imgL, imgT, imgW, imgH);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    const cx2 = imgL + imgW / 2;
+                    const cy2 = imgT + imgH / 2;
+                    ctx.moveTo(cx2 - 30, cy2 - 40);
+                    ctx.lineTo(cx2 - 30, cy2 + 40);
+                    ctx.lineTo(cx2 + 40, cy2);
+                    ctx.closePath(); ctx.fill();
+                    tex.needsUpdate = true;
+                } else if (media.media_type === 'audio') {
+                    ctx.fillStyle = '#1a1a2e';
+                    ctx.fillRect(imgL, imgT, imgW, imgH);
+                    ctx.fillStyle = '#888888';
+                    ctx.font = '64px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('\u266B', imgL + imgW / 2, imgT + imgH / 2 + 20);
+                    tex.needsUpdate = true;
+                }
+
+                const geom = new THREE.PlaneGeometry(pw, ph);
+                const mat2 = new THREE.MeshBasicMaterial({
+                    map: tex,
+                    polygonOffset: true,
+                    polygonOffsetFactor: -1,
+                    polygonOffsetUnits: -1,
+                });
+                const mesh = new THREE.Mesh(geom, mat2);
+                mesh.position.copy(pos3);
+                mesh.rotation.y = wallDef.rot;
+                mesh.userData = { mediaIndex: MEDIA_MARKERS.length + globalIdx, ...media };
+                wallMediaGroup.add(mesh);
+                markerMeshes.push(mesh);
+            });
+        });
+    }
+
     scene.add(mediaMarkerGroup);
+    scene.add(wallMediaGroup);
 }
 
 // === CAMERA PRESETS ===
@@ -1082,15 +1472,19 @@ function updateCamera(t, dt) {
 }
 
 // === MEDIA TRIGGERS ===
+let autoMediaTimer = null;
+let autoMediaQueue = [];
+
 function checkMediaTriggers(currentProgress) {
     const totalPoints = TRAIL_POINTS.length;
+    const autoShow = document.getElementById('auto-media').checked;
     MEDIA_MARKERS.forEach((media, index) => {
         if (triggeredMedia.has(index)) return;
         const mediaProgress = media.trackpoint_index / (totalPoints - 1);
         if (Math.abs(currentProgress - mediaProgress) < TRIGGER_THRESHOLD) {
             triggeredMedia.add(index);
-            if (CONFIG.mediaMode === 'thumbnail') {
-                showThumbnailPopup(media, index);
+            if (autoShow) {
+                autoMediaQueue.push(media);
             } else if (CONFIG.mediaMode === 'autopause') {
                 isPlaying = false;
                 controls.enabled = true;
@@ -1099,41 +1493,72 @@ function checkMediaTriggers(currentProgress) {
             }
         }
     });
+    // Process auto-show queue one at a time
+    if (autoShow && autoMediaQueue.length > 0 && !document.getElementById('media-popup').classList.contains('visible')) {
+        const next = autoMediaQueue.shift();
+        showFullMedia(next, true);
+    }
 }
 
-// Gallery-style notification label when hiker passes a display
-const activePopups = [];
-function showThumbnailPopup(media, index) {
-    const div = document.createElement('div');
-    div.style.cssText = 'pointer-events:auto;cursor:pointer;padding:8px 14px;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);border:1px solid rgba(192,160,96,0.5);border-radius:6px;color:#fff;font-size:12px;font-family:sans-serif;text-align:center;white-space:nowrap;';
-    const typeIcon = media.media_type === 'photo' ? '\uD83D\uDDBC' : media.media_type === 'video' ? '\uD83C\uDFAC' : '\uD83C\uDFB5';
-    const shortName = media.filename.length > 24 ? media.filename.substring(0, 21) + '...' : media.filename;
-    div.innerHTML = typeIcon + ' <b>' + shortName + '</b><br><span style="opacity:0.6;font-size:10px">Click to view</span>';
-    div.addEventListener('click', (e) => {
-        e.stopPropagation();
+let wasPlayingBeforePopup = false;
+
+function showFullMedia(media, isAutoShow) {
+    const popup = document.getElementById('media-popup');
+    const content = document.getElementById('media-popup-content');
+
+    // Clear any pending auto-dismiss timer
+    if (autoMediaTimer) { clearTimeout(autoMediaTimer); autoMediaTimer = null; }
+
+    // Pause animation while viewing media
+    wasPlayingBeforePopup = isPlaying;
+    if (isPlaying) {
         isPlaying = false;
         controls.enabled = true;
         updatePlayPauseBtn();
-        showFullMedia(media);
-    });
+    }
 
-    const label = new CSS2DObject(div);
-    label.position.set(media.x, media.y + maxExtent * 0.05, media.z);
-    scene.add(label);
-    activePopups.push({ label, time: Date.now() });
-}
-
-function showFullMedia(media) {
-    const popup = document.getElementById('media-popup');
-    const content = document.getElementById('media-popup-content');
     if (media.media_type === 'photo') {
         content.innerHTML = '<img src="assets/' + media.output_filename + '">';
+        // Auto-dismiss after delay for photos
+        if (isAutoShow) {
+            const delay = parseFloat(document.getElementById('auto-media-delay').value) || 3;
+            autoMediaTimer = setTimeout(() => { autoMediaTimer = null; closeMediaPopup(); }, delay * 1000);
+        }
     } else if (media.media_type === 'video') {
         content.innerHTML = '<video src="assets/' + media.output_filename + '" controls autoplay style="max-width:90vw;max-height:85vh"></video>';
+        // Auto-dismiss when video ends
+        if (isAutoShow) {
+            const vid = content.querySelector('video');
+            vid.addEventListener('ended', () => closeMediaPopup(), { once: true });
+        }
     } else {
         content.innerHTML = '<div style="background:#222;padding:40px;border-radius:12px;text-align:center;color:#fff"><p style="margin-bottom:16px">' + media.filename + '</p><audio src="assets/' + media.output_filename + '" controls autoplay></audio></div>';
+        if (isAutoShow) {
+            const aud = content.querySelector('audio');
+            aud.addEventListener('ended', () => closeMediaPopup(), { once: true });
+        }
     }
     popup.classList.add('visible');
+}
+
+function closeMediaPopup() {
+    if (autoMediaTimer) { clearTimeout(autoMediaTimer); autoMediaTimer = null; }
+    // Stop any playing video/audio
+    const vid = document.querySelector('#media-popup-content video');
+    if (vid) { vid.pause(); vid.src = ''; }
+    const aud = document.querySelector('#media-popup-content audio');
+    if (aud) { aud.pause(); aud.src = ''; }
+    document.getElementById('media-popup').classList.remove('visible');
+    document.getElementById('media-popup-content').innerHTML = '';
+    // Resume animation if it was playing before the popup opened
+    if (wasPlayingBeforePopup) {
+        isPlaying = true;
+        controls.enabled = false;
+        camInitialized = false;
+        hikerInitialized = false;
+        updatePlayPauseBtn();
+        wasPlayingBeforePopup = false;
+    }
 }
 
 // Raycaster for marker clicks
@@ -1144,10 +1569,10 @@ renderer.domElement.addEventListener('click', (e) => {
     mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
     mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
     raycaster.setFromCamera(mouse, camera);
-    // Check image planes (direct) and all gallery group children
-    const hits = raycaster.intersectObjects(mediaMarkerGroup.children, true);
+    // Check trail media and wall media first
+    const allClickable = [...mediaMarkerGroup.children, ...wallMediaGroup.children];
+    const hits = raycaster.intersectObjects(allClickable, true);
     if (hits.length > 0) {
-        // Walk up to find the mesh with userData.mediaIndex
         let data = null;
         for (const hit of hits) {
             if (hit.object.userData && hit.object.userData.mediaIndex !== undefined) {
@@ -1155,7 +1580,42 @@ renderer.domElement.addEventListener('click', (e) => {
                 break;
             }
         }
-        if (data) showFullMedia(data);
+        if (data) { showFullMedia(data); return; }
+    }
+    // Check trail click — move hiker to clicked position
+    const trailObjects = [];
+    if (trailMesh) trailObjects.push(trailMesh);
+    if (trailLine) trailObjects.push(trailLine);
+    const trailHits = raycaster.intersectObjects(trailObjects, false);
+    if (trailHits.length > 0) {
+        const hitPoint = trailHits[0].point;
+        // Find closest t on trailCurve by sampling
+        const samples = 1000;
+        let bestT = 0, bestDist = Infinity;
+        for (let i = 0; i <= samples; i++) {
+            const t = i / samples;
+            const pt = trailCurve.getPointAt(t);
+            const d = pt.distanceToSquared(hitPoint);
+            if (d < bestDist) { bestDist = d; bestT = t; }
+        }
+        // Refine with finer search around bestT
+        const step = 1 / samples;
+        const lo = Math.max(0, bestT - step);
+        const hi = Math.min(1, bestT + step);
+        for (let i = 0; i <= 100; i++) {
+            const t = lo + (hi - lo) * i / 100;
+            const pt = trailCurve.getPointAt(t);
+            const d = pt.distanceToSquared(hitPoint);
+            if (d < bestDist) { bestDist = d; bestT = t; }
+        }
+        progress = bestT;
+        hikerInitialized = false;
+        // Don't reset camInitialized — camera stays put and smoothly
+        // lerps to the new position when animation plays
+        updateHikerPosition(progress);
+        updateTimeDisplay();
+        updateRunningStats();
+        progressSlider.value = progress * 1000;
     }
 });
 
@@ -1163,7 +1623,7 @@ renderer.domElement.addEventListener('click', (e) => {
 function applyStyle(style) {
     currentStyle = style;
     setupLighting(style);
-    createGround(style);
+    createRoom(style);
     createTrailGeometry(style, currentColorMode);
 }
 
@@ -1202,9 +1662,18 @@ progressSlider.addEventListener('input', (e) => {
     // Instant snap on scrub — reset smoothing
     hikerInitialized = false;
     camInitialized = false;
+    // Re-arm media triggers for anything ahead of new position
+    triggeredMedia.clear();
+    autoMediaQueue = [];
+    const totalPoints = TRAIL_POINTS.length;
+    MEDIA_MARKERS.forEach((media, index) => {
+        const mp = media.trackpoint_index / (totalPoints - 1);
+        if (mp < progress - TRIGGER_THRESHOLD) triggeredMedia.add(index);
+    });
     updateHikerPosition(progress);
     updateCamera(progress);
     updateTimeDisplay();
+    updateRunningStats();
 });
 
 speedSlider.addEventListener('input', (e) => {
@@ -1217,6 +1686,43 @@ function updateTimeDisplay() {
     const total = animationDuration;
     const fmt = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
     timeDisplay.textContent = fmt(elapsed) + ' / ' + fmt(total);
+}
+
+function updateRunningStats() {
+    // Interpolate between trackpoints for smooth, accurate values
+    const n = TRAIL_POINTS.length - 1;
+    const rawIdx = Math.max(0, Math.min(n, progress * n));
+    const lo = Math.min(Math.floor(rawIdx), n);
+    const hi = Math.min(lo + 1, n);
+    const frac = rawIdx - lo;
+
+    const a = TRAIL_POINTS[lo];
+    const b = TRAIL_POINTS[hi];
+
+    const dist = a.cumDist + (b.cumDist - a.cumDist) * frac;
+    const ascent = a.cumAscent + (b.cumAscent - a.cumAscent) * frac;
+    const descent = a.cumDescent + (b.cumDescent - a.cumDescent) * frac;
+    const elapsed = a.elapsed + (b.elapsed - a.elapsed) * frac;
+
+    document.getElementById('run-dist').textContent = dist.toFixed(1);
+    document.getElementById('run-ascent').textContent = Math.round(ascent).toLocaleString();
+    document.getElementById('run-descent').textContent = Math.round(descent).toLocaleString();
+
+    // Format hike elapsed time as h:mm:ss, m:ss, or s sec
+    const sec = Math.round(elapsed);
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    let timeStr;
+    if (h > 0) {
+        timeStr = h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    } else if (m > 0) {
+        timeStr = m + ':' + String(s).padStart(2, '0');
+    } else {
+        timeStr = s + ' sec';
+    }
+    document.getElementById('run-time').textContent = timeStr;
+    document.getElementById('running-stats').style.display = '';
 }
 
 // Camera preset buttons
@@ -1247,20 +1753,27 @@ document.querySelectorAll('#color-group button').forEach(btn => {
     });
 });
 
-// Media popup close
-document.getElementById('media-popup-close').addEventListener('click', () => {
-    document.getElementById('media-popup').classList.remove('visible');
-    document.getElementById('media-popup-content').innerHTML = '';
-});
-document.getElementById('media-popup').addEventListener('click', (e) => {
-    if (e.target === e.currentTarget) {
-        document.getElementById('media-popup').classList.remove('visible');
-        document.getElementById('media-popup-content').innerHTML = '';
+// Auto-media toggle: clear queue when unchecked
+document.getElementById('auto-media').addEventListener('change', (e) => {
+    if (!e.target.checked) {
+        autoMediaQueue = [];
+        if (autoMediaTimer) { clearTimeout(autoMediaTimer); autoMediaTimer = null; }
     }
+});
+
+// Media popup close
+document.getElementById('media-popup-close').addEventListener('click', closeMediaPopup);
+document.getElementById('media-popup').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeMediaPopup();
 });
 
 // Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
+    // Close media popup on Escape
+    if (e.code === 'Escape' && document.getElementById('media-popup').classList.contains('visible')) {
+        closeMediaPopup();
+        return;
+    }
     if (e.code === 'Space') {
         e.preventDefault();
         playPauseBtn.click();
@@ -1270,12 +1783,16 @@ document.addEventListener('keydown', (e) => {
         camInitialized = false;
         updateHikerPosition(progress);
         updateCamera(progress);
+        updateTimeDisplay();
+        updateRunningStats();
     } else if (e.code === 'ArrowLeft') {
         progress = Math.max(0, progress - 0.01);
         hikerInitialized = false;
         camInitialized = false;
         updateHikerPosition(progress);
         updateCamera(progress);
+        updateTimeDisplay();
+        updateRunningStats();
     }
 });
 
@@ -1297,8 +1814,25 @@ document.getElementById('stat-elev').textContent = HIKE_META.elevation_gain_ft.t
 applyStyle(currentStyle);
 createMediaMarkers();
 updateHikerPosition(0);
-updateCamera(0);
+
+// Start with museum-goer perspective: standing at room edge, looking at sculpture
+// Position camera at front-right of room, human eye height above floor
+const eyeHeight = trailCenter.y; // eye level at sculpture center
+const viewDist = maxExtent * 0.7; // distance from sculpture center
+camera.position.set(
+    trailCenter.x + viewDist * 0.6,
+    eyeHeight,
+    trailCenter.z + viewDist * 0.7
+);
+camera.lookAt(trailCenter);
+camPos.copy(camera.position);
+camTarget.copy(trailCenter);
+controls.target.copy(trailCenter);
 camInitialized = true;
+
+// Start paused so the user sees the sculpture first
+isPlaying = false;
+controls.enabled = true;
 
 // Set initial style button active state
 document.querySelectorAll('#style-group button').forEach(b => b.classList.remove('active'));
@@ -1337,20 +1871,23 @@ function animate(timestamp) {
         checkMediaTriggers(progress);
         progressSlider.value = progress;
         updateTimeDisplay();
+        updateRunningStats();
     }
 
-    // Clean old popups
-    const now = Date.now();
-    for (let i = activePopups.length - 1; i >= 0; i--) {
-        if (isPlaying && now - activePopups[i].time > 5000) {
-            scene.remove(activePopups[i].label);
-            activePopups.splice(i, 1);
-        }
-    }
+    // Billboard: make all media thumbnails face the camera
+    mediaMarkerGroup.children.forEach(child => {
+        child.quaternion.copy(camera.quaternion);
+    });
 
     if (!isPlaying) {
         controls.update();
     }
+
+    // Clamp camera inside room boundaries
+    const camMargin = margin * 0.5;
+    camera.position.x = Math.max(cx - hw + camMargin, Math.min(cx + hw - camMargin, camera.position.x));
+    camera.position.y = Math.max(roomFloorY + camMargin, Math.min(roomCeilY - camMargin, camera.position.y));
+    camera.position.z = Math.max(cz - hd + camMargin, Math.min(cz + hd - camMargin, camera.position.z));
 
     renderer.render(scene, camera);
     labelRenderer.render(scene, camera);
@@ -1392,7 +1929,13 @@ def main():
         trail_colors = prepare_trail_colors(hike_data, xyz_points)
         media_data = prepare_media_data(hike_data, xyz_points)
 
-        print(f"Media markers: {len(media_data)}")
+        trail_count = len(media_data["trail"])
+        wall_count = len(media_data["wall"])
+        print(f"Media: {trail_count} on trail, {wall_count} on walls")
+        if args.verbose and wall_count > 0:
+            for wm in media_data["wall"]:
+                print(f"  Wall: {wm['filename']} (timestamp outside hike window or no EXIF)")
+
 
         # Check if HR data actually exists
         has_hr = any(tp.heart_rate is not None for tp in hike_data.trackpoints)
@@ -1423,9 +1966,10 @@ def main():
         html_path.write_text(html, encoding="utf-8")
 
         # Copy media
-        if media_data:
+        total_media = trail_count + wall_count
+        if total_media:
             copy_media_assets(hike_data, output_dir)
-            print(f"Copied {len(media_data)} media files to assets/")
+            print(f"Copied {total_media} media files to assets/")
 
         print(f"\nGenerated: {html_path}")
         print(f"Open in your browser to view the 3D animation.")

@@ -29,6 +29,7 @@ class MediaItem:
     height: Optional[int] = None
     duration_seconds: Optional[float] = None  # For video/audio
     is_360: bool = False  # True for 360/panoramic photos
+    has_exif_timestamp: bool = False  # True when timestamp from EXIF/metadata, not file mtime
 
     # Calculated during merge
     nearest_trackpoint_index: Optional[int] = None

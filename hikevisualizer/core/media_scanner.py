@@ -78,6 +78,7 @@ class MediaScanner:
                     width=width,
                     height=height,
                     is_360=is_360,
+                    has_exif_timestamp=timestamp is not None,
                 )
         except Exception:
             # If PIL fails, try to create a basic entry
@@ -95,27 +96,22 @@ class MediaScanner:
         try:
             exif = img.getexif()
             if exif:
-                # Check main EXIF tags: DateTimeOriginal, DateTimeDigitized, DateTime
-                for tag_id in [36867, 36868, 306]:
-                    if tag_id in exif:
-                        dt_str = exif[tag_id]
-                        if dt_str:
-                            dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-                            return self._make_aware(dt)
-
-                # Check EXIF IFD for DateTimeOriginal
+                # Get the EXIF IFD (contains offset tags and datetime tags)
+                exif_ifd = {}
                 try:
                     from PIL.ExifTags import IFD
-                    exif_ifd = exif.get_ifd(IFD.Exif)
-                    if exif_ifd:
-                        for tag_id in [36867, 36868]:
-                            if tag_id in exif_ifd:
-                                dt_str = exif_ifd[tag_id]
-                                if dt_str:
-                                    dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-                                    return self._make_aware(dt)
+                    exif_ifd = exif.get_ifd(IFD.Exif) or {}
                 except (ImportError, AttributeError):
                     pass
+
+                # Check main EXIF tags: DateTimeOriginal, DateTimeDigitized, DateTime
+                for tag_id in [36867, 36868, 306]:
+                    dt_str = exif.get(tag_id) or exif_ifd.get(tag_id)
+                    if dt_str:
+                        dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+                        # Look for matching OffsetTime tag in both IFDs
+                        offset = self._get_exif_offset(exif_ifd, tag_id) or self._get_exif_offset(exif, tag_id)
+                        return self._apply_offset(dt, offset)
         except Exception:
             pass
 
@@ -156,6 +152,7 @@ class MediaScanner:
                     width=width,
                     height=height,
                     is_360=is_360,
+                    has_exif_timestamp=timestamp is not None,
                 )
         except ImportError:
             # pillow-heif not installed, create basic entry
@@ -188,25 +185,20 @@ class MediaScanner:
         try:
             exif = img.getexif()
             if exif:
-                # Check main EXIF tags
-                # 306 = DateTime, 36867 = DateTimeOriginal, 36868 = DateTimeDigitized
-                for tag_id in [36867, 36868, 306]:
-                    if tag_id in exif:
-                        dt_str = exif[tag_id]
-                        if dt_str:
-                            dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-                            return self._make_aware(dt)
+                # Get the EXIF IFD (contains offset tags and datetime tags)
+                exif_ifd = {}
+                try:
+                    from PIL.ExifTags import IFD
+                    exif_ifd = exif.get_ifd(IFD.Exif) or {}
+                except (ImportError, AttributeError):
+                    pass
 
-                # Check EXIF IFD for DateTimeOriginal
-                from PIL.ExifTags import IFD
-                exif_ifd = exif.get_ifd(IFD.Exif)
-                if exif_ifd:
-                    for tag_id in [36867, 36868]:
-                        if tag_id in exif_ifd:
-                            dt_str = exif_ifd[tag_id]
-                            if dt_str:
-                                dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-                                return self._make_aware(dt)
+                for tag_id in [36867, 36868, 306]:
+                    dt_str = exif.get(tag_id) or exif_ifd.get(tag_id)
+                    if dt_str:
+                        dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+                        offset = self._get_exif_offset(exif_ifd, tag_id) or self._get_exif_offset(exif, tag_id)
+                        return self._apply_offset(dt, offset)
         except Exception:
             pass
 
@@ -222,20 +214,20 @@ class MediaScanner:
         return None
 
     def _extract_exif_datetime(self, exif_data: dict) -> Optional[datetime]:
-        """Extract DateTimeOriginal from EXIF data."""
+        """Extract DateTimeOriginal from EXIF data (legacy _getexif() API)."""
         if not exif_data:
             return None
 
         # Priority: DateTimeOriginal > DateTimeDigitized > DateTime
-        datetime_tags = [36867, 36868, 306]  # Tag IDs
+        datetime_tags = [36867, 36868, 306]
 
         for tag_id in datetime_tags:
             if tag_id in exif_data:
                 try:
-                    # EXIF datetime format: "YYYY:MM:DD HH:MM:SS"
                     dt_str = exif_data[tag_id]
                     dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-                    return self._make_aware(dt)
+                    offset = self._get_exif_offset(exif_data, tag_id)
+                    return self._apply_offset(dt, offset)
                 except (ValueError, TypeError):
                     continue
 
@@ -246,11 +238,15 @@ class MediaScanner:
         metadata = self._ffprobe_metadata(file_path)
 
         timestamp = self._get_file_mtime(file_path)
+        has_exif = False
         duration = None
         width, height = None, None
 
         if metadata:
-            timestamp = self._extract_ffprobe_timestamp(metadata) or timestamp
+            ffprobe_ts = self._extract_ffprobe_timestamp(metadata)
+            if ffprobe_ts:
+                timestamp = ffprobe_ts
+                has_exif = True
             duration = self._extract_duration(metadata)
             width, height = self._extract_dimensions(metadata)
 
@@ -263,6 +259,7 @@ class MediaScanner:
             width=width,
             height=height,
             duration_seconds=duration,
+            has_exif_timestamp=has_exif,
         )
 
     def _process_audio(self, file_path: Path) -> Optional[MediaItem]:
@@ -270,10 +267,14 @@ class MediaScanner:
         metadata = self._ffprobe_metadata(file_path)
 
         timestamp = self._get_file_mtime(file_path)
+        has_exif = False
         duration = None
 
         if metadata:
-            timestamp = self._extract_ffprobe_timestamp(metadata) or timestamp
+            ffprobe_ts = self._extract_ffprobe_timestamp(metadata)
+            if ffprobe_ts:
+                timestamp = ffprobe_ts
+                has_exif = True
             duration = self._extract_duration(metadata)
 
         return MediaItem(
@@ -283,6 +284,7 @@ class MediaScanner:
             filename=file_path.name,
             output_filename=self._sanitize_filename(file_path.name),
             duration_seconds=duration,
+            has_exif_timestamp=has_exif,
         )
 
     def _ffprobe_metadata(self, file_path: Path) -> Optional[dict]:
@@ -350,6 +352,44 @@ class MediaScanner:
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt
+
+    @staticmethod
+    def _apply_offset(dt: datetime, offset_str: Optional[str]) -> datetime:
+        """Apply an EXIF OffsetTime string (e.g. '-04:00', '+05:30') to a naive datetime.
+
+        If offset_str is valid, returns a timezone-aware datetime in UTC.
+        Otherwise falls back to assuming UTC.
+        """
+        if offset_str and isinstance(offset_str, str):
+            try:
+                offset_str = offset_str.strip()
+                sign = 1 if offset_str.startswith('+') else -1
+                parts = offset_str.lstrip('+-').split(':')
+                hours = int(parts[0])
+                minutes = int(parts[1]) if len(parts) > 1 else 0
+                from datetime import timedelta
+                tz = timezone(timedelta(hours=sign * hours, minutes=sign * minutes))
+                return dt.replace(tzinfo=tz)
+            except (ValueError, IndexError):
+                pass
+        # Fallback: assume UTC
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    @staticmethod
+    def _get_exif_offset(exif_source: dict, dt_tag_id: int) -> Optional[str]:
+        """Get the OffsetTime string matching a DateTime EXIF tag.
+
+        Mapping: DateTimeOriginal(36867)->OffsetTimeOriginal(36881),
+                 DateTimeDigitized(36868)->OffsetTimeDigitized(36882),
+                 DateTime(306)->OffsetTime(36880).
+        """
+        offset_map = {36867: 36881, 36868: 36882, 306: 36880}
+        offset_tag = offset_map.get(dt_tag_id)
+        if offset_tag and offset_tag in exif_source:
+            return exif_source[offset_tag]
+        return None
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
