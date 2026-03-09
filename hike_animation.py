@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import html
 import json
 import logging
 import math
@@ -149,6 +150,9 @@ def process_hike_data(files: dict, title: Optional[str], verbose: bool) -> HikeD
 
     if title:
         hike_data.name = title
+    else:
+        # Default to the folder name containing the GPX files
+        hike_data.name = Path(files["gpx"][0]).resolve().parent.name
 
     logger.info(f"Track: {len(hike_data.trackpoints)} points, {hike_data.distance_miles:.1f} miles")
 
@@ -404,7 +408,7 @@ def prepare_media_data(hike_data: HikeData, xyz_points: List[dict]) -> dict:
 # Media asset copying
 # ---------------------------------------------------------------------------
 
-def copy_media_assets(hike_data: HikeData, output_dir: Path, max_texture_size: int = 512) -> None:
+def copy_media_assets(hike_data: HikeData, output_dir: Path, max_texture_size: int = 1024) -> None:
     """Copy media assets, resizing images to max_texture_size for GPU performance."""
     assets_dir = output_dir / "assets"
     assets_dir.mkdir(exist_ok=True)
@@ -437,7 +441,7 @@ def _resize_image(src: Path, dst: Path, max_size: int) -> None:
             rgb.save(dst, "JPEG", quality=80)
 
 
-def _convert_heic(src: Path, dst: Path, max_size: int = 512) -> None:
+def _convert_heic(src: Path, dst: Path, max_size: int = 1024) -> None:
     from PIL import Image
     from pillow_heif import register_heif_opener
     register_heif_opener()
@@ -484,7 +488,8 @@ def generate_html(
     meta_json = json.dumps(meta)
     config_json = json.dumps(config)
 
-    return _HTML_TEMPLATE.replace("__TRAIL_DATA__", trail_data) \
+    return _HTML_TEMPLATE.replace("__PAGE_TITLE__", html.escape(hike_data.name)) \
+        .replace("__TRAIL_DATA__", trail_data) \
         .replace("__CAM_DATA__", cam_data) \
         .replace("__COLOR_DATA__", color_data) \
         .replace("__MEDIA_DATA__", media_json) \
@@ -501,7 +506,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trail 3D Animation</title>
+<title>__PAGE_TITLE__</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000}
@@ -1805,7 +1810,9 @@ document.addEventListener('keydown', (e) => {
     }
     if (e.code === 'Space') {
         e.preventDefault();
-        playPauseBtn.click();
+        if (!document.getElementById('media-popup').classList.contains('visible')) {
+            playPauseBtn.click();
+        }
     } else if (e.code === 'ArrowRight') {
         progress = Math.min(1, progress + 0.01);
         hikerInitialized = false;
