@@ -78,12 +78,13 @@ def discover_files(input_dir: Path) -> dict:
         raise NotADirectoryError(f"Directory not found: {input_dir}")
 
     gpx_files = find_files(input_dir, [".gpx"])
-    if not gpx_files:
-        raise FileNotFoundError(f"No GPX files found in {input_dir}")
-
     fit_files = find_files(input_dir, [".fit"])
 
-    print(f"Found {len(gpx_files)} GPX file(s): {', '.join(f.name for f in gpx_files)}")
+    if not gpx_files and not fit_files:
+        raise FileNotFoundError(f"No GPX or FIT files found in {input_dir}")
+
+    if gpx_files:
+        print(f"Found {len(gpx_files)} GPX file(s): {', '.join(f.name for f in gpx_files)}")
     if fit_files:
         print(f"Found {len(fit_files)} FIT file(s): {', '.join(f.name for f in fit_files)}")
 
@@ -119,7 +120,7 @@ def process_hike_data(files: dict, title: Optional[str], verbose: bool) -> HikeD
     """Parse GPX/FIT files, merge data, calculate HR zones."""
     min_dt = datetime.min.replace(tzinfo=timezone.utc)
 
-    # Parse all GPX files
+    # --- Phase 1: Parse GPX files (if any) ---
     parsed_tracks = []
     for gpx_path in files["gpx"]:
         logger.info(f"Parsing GPX: {gpx_path}")
@@ -127,55 +128,97 @@ def process_hike_data(files: dict, title: Optional[str], verbose: bool) -> HikeD
         start = parsed.trackpoints[0].timestamp if parsed.trackpoints else None
         parsed_tracks.append({"name": parsed.name or gpx_path.stem, "data": parsed, "start": start})
 
-    parsed_tracks.sort(key=lambda t: t["start"] if t["start"] else min_dt)
+    # --- Phase 2: Parse FIT files for track + HR ---
+    fit_results = []
+    for fit_path in files["fit"]:
+        try:
+            result = FITParser(str(fit_path)).parse_track()
+            fit_results.append({"path": fit_path, "result": result})
+        except Exception as e:
+            logger.warning(f"Could not parse FIT {fit_path}: {e}")
 
-    # Combine into single HikeData
-    hike_data = parsed_tracks[0]["data"]
-    for track in parsed_tracks[1:]:
-        hike_data.trackpoints.extend(track["data"].trackpoints)
+    # --- Phase 3: Compute GPX time range for duplicate detection ---
+    gpx_start, gpx_end = None, None
+    if parsed_tracks:
+        gpx_times = [tp.timestamp for t in parsed_tracks for tp in t["data"].trackpoints if tp.timestamp]
+        if gpx_times:
+            gpx_start, gpx_end = min(gpx_times), max(gpx_times)
 
-    # Sort all trackpoints by timestamp to ensure time-order traversal
+    # --- Phase 4: Decide per FIT file: track source vs HR-only ---
+    fit_hr_only = []       # HR records to merge into GPX-sourced trackpoints
+    fit_track_sources = [] # FIT results whose trackpoints will be used
+
+    for entry in fit_results:
+        result = entry["result"]
+        if result.has_gps and parsed_tracks:
+            # Both GPX and FIT have tracks — check for duplicate
+            fit_start = result.trackpoints[0].timestamp if result.trackpoints else None
+            fit_end = result.trackpoints[-1].timestamp if result.trackpoints else None
+            if DataMerger.tracks_overlap(gpx_start, gpx_end, fit_start, fit_end):
+                logger.info(f"FIT track overlaps GPX — using HR only from {entry['path'].name}")
+                fit_hr_only.extend(result.hr_records)
+            else:
+                fit_track_sources.append(result)
+        elif result.has_gps:
+            # No GPX — use FIT as track source
+            fit_track_sources.append(result)
+        else:
+            # FIT has no GPS — HR only
+            fit_hr_only.extend(result.hr_records)
+
+    # --- Phase 5: Build HikeData ---
+    if parsed_tracks:
+        parsed_tracks.sort(key=lambda t: t["start"] if t["start"] else min_dt)
+        hike_data = parsed_tracks[0]["data"]
+        for track in parsed_tracks[1:]:
+            hike_data.trackpoints.extend(track["data"].trackpoints)
+    else:
+        hike_data = HikeData()
+
+    # Add trackpoints from non-duplicate FIT files
+    for fit_result in fit_track_sources:
+        hike_data.trackpoints.extend(fit_result.trackpoints)
+        # Collect HR records for any GPX-sourced points that need merging
+        fit_hr_only.extend(fit_result.hr_records)
+
+    # Sort all trackpoints by timestamp
     hike_data.trackpoints.sort(key=lambda tp: tp.timestamp if tp.timestamp else min_dt)
 
-    # Recalculate distances and stats after sort
+    # Recalculate distances and stats after combining/sorting
     if len(hike_data.trackpoints) > 1:
         _recalculate_distances(hike_data)
-    hike_data.elevation_stats = hike_data.elevation_stats  # keep existing from first parse
     if hike_data.trackpoints:
         hike_data.start_time = hike_data.trackpoints[0].timestamp
         hike_data.end_time = hike_data.trackpoints[-1].timestamp
         if hike_data.start_time and hike_data.end_time:
             hike_data.duration = hike_data.end_time - hike_data.start_time
         hike_data.total_distance = hike_data.trackpoints[-1].distance_from_start
+        # Calculate elevation stats (needed for FIT-only; GPX already has them)
+        if not hike_data.elevation_stats:
+            hike_data.elevation_stats = GPXParser._calculate_elevation_stats(hike_data.trackpoints)
 
+    # --- Phase 6: Set title ---
     if title:
         hike_data.name = title
     else:
-        # Default to the folder name containing the GPX files
-        hike_data.name = Path(files["gpx"][0]).resolve().parent.name
+        first_file = files["gpx"][0] if files["gpx"] else files["fit"][0]
+        hike_data.name = Path(first_file).resolve().parent.name
 
     logger.info(f"Track: {len(hike_data.trackpoints)} points, {hike_data.distance_miles:.1f} miles")
 
-    # Parse FIT files and merge HR
-    if files["fit"]:
-        all_hr = []
-        for fit_path in files["fit"]:
-            try:
-                all_hr.extend(FITParser(str(fit_path)).parse())
-            except Exception as e:
-                logger.warning(f"Could not parse FIT {fit_path}: {e}")
-        if all_hr:
-            DataMerger(hike_data).merge_heart_rate(all_hr)
-            logger.info(f"Merged {len(all_hr)} HR records")
+    # --- Phase 7: Merge HR data into GPX-sourced trackpoints ---
+    if fit_hr_only:
+        DataMerger(hike_data).merge_heart_rate(fit_hr_only)
+        logger.info(f"Merged {len(fit_hr_only)} HR records")
 
-    # Scan and merge media
+    # --- Phase 8: Scan and merge media ---
     scanner = MediaScanner(str(files["media_dir"]), exclude_dirs=["output", "assets", "Trail3D"])
     media_items = scanner.scan()
     if media_items:
         DataMerger(hike_data).merge_media(media_items)
         logger.info(f"Found {len(media_items)} media files")
 
-    # Calculate HR zones
+    # --- Phase 9: Calculate HR zones ---
     HRZoneCalculator(hike_data).calculate_zones()
 
     return hike_data
@@ -975,17 +1018,17 @@ function createRoom(style) {
     const hw = roomWidth / 2;
     const hd = roomDepth / 2;
 
-    const floorColor = style === 'minimal' ? 0x999999 : style === 'topographic' ? 0x9a9a9a : 0x8a8a8a;
-    const wallColor = style === 'minimal' ? 0xc0c0c0 : style === 'topographic' ? 0xbbbbbb : 0xb0b0b0;
-    const ceilColor = style === 'minimal' ? 0xd0d0d0 : style === 'topographic' ? 0xcccccc : 0xc5c5c5;
+    const floorColor = style === 'minimal' ? 0xe8e4df : style === 'topographic' ? 0xe5e1dc : 0xe0dcd7;
+    const wallColor = style === 'minimal' ? 0xf5f2ed : style === 'topographic' ? 0xf2efea : 0xeee9e4;
+    const ceilColor = style === 'minimal' ? 0xfaf8f5 : style === 'topographic' ? 0xf8f5f2 : 0xf5f2ef;
 
     // Grid on floor for minimal/topo styles
     if (style === 'minimal') {
-        gridHelper = new THREE.GridHelper(Math.max(roomWidth, roomDepth), 60, 0x888888, 0x777777);
+        gridHelper = new THREE.GridHelper(Math.max(roomWidth, roomDepth), 60, 0xd5d0cb, 0xccc7c1);
         gridHelper.position.set(cx, roomFloorY + 0.1, cz);
         scene.add(gridHelper);
     } else if (style === 'topographic') {
-        gridHelper = new THREE.GridHelper(Math.max(roomWidth, roomDepth), 80, 0x888888, 0x787878);
+        gridHelper = new THREE.GridHelper(Math.max(roomWidth, roomDepth), 80, 0xd5d0cb, 0xcdc8c2);
         gridHelper.position.set(cx, roomFloorY + 0.1, cz);
         scene.add(gridHelper);
     }
@@ -1072,7 +1115,7 @@ function createRoom(style) {
 
     // --- Edge lines at wall/ceiling and wall/floor junctions ---
     // Offset lines slightly inward so they don't z-fight with surfaces
-    const edgeColor = 0x888888;
+    const edgeColor = 0xd5d0cb;
     const edgeMat = new THREE.LineBasicMaterial({ color: edgeColor });
     const eo = maxExtent * 0.01; // edge offset inward from surfaces
 
@@ -1156,7 +1199,6 @@ const markerMeshes = [];  // clickable meshes for raycaster
 function makeMediaMaterial(media, doubleSide) {
     const mat = new THREE.MeshBasicMaterial({
         side: doubleSide ? THREE.DoubleSide : THREE.FrontSide,
-        depthWrite: false,
     });
     if (media.media_type === 'photo' && media.thumb_b64) {
         const img = new Image();
@@ -1397,6 +1439,7 @@ function createMediaMarkers() {
                     polygonOffset: true,
                     polygonOffsetFactor: -1,
                     polygonOffsetUnits: -1,
+                    depthWrite: false,
                 });
                 const mesh = new THREE.Mesh(geom, mat2);
                 mesh.position.copy(pos3);
@@ -1408,8 +1451,12 @@ function createMediaMarkers() {
         });
     }
 
-    scene.add(mediaMarkerGroup);
+    // Wall media renders behind trail thumbnails
+    wallMediaGroup.renderOrder = 0;
+    mediaMarkerGroup.renderOrder = 1;
+    mediaMarkerGroup.children.forEach(c => { c.renderOrder = 1; });
     scene.add(wallMediaGroup);
+    scene.add(mediaMarkerGroup);
 }
 
 // === CAMERA PRESETS ===
@@ -1955,7 +2002,7 @@ def main():
         hike_data = process_hike_data(files, args.title, args.verbose)
 
         if not hike_data.trackpoints:
-            print("Error: No trackpoints found in GPX files.", file=sys.stderr)
+            print("Error: No trackpoints found in GPX or FIT files.", file=sys.stderr)
             sys.exit(1)
 
         print(f"Trail: {len(hike_data.trackpoints)} points, {hike_data.distance_miles:.1f} miles")

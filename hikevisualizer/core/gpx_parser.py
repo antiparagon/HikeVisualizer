@@ -79,8 +79,9 @@ class GPXParser:
 
         return points
 
+    @staticmethod
     def _calculate_elevation_stats(
-        self, trackpoints: List[TrackPoint]
+        trackpoints: List[TrackPoint],
     ) -> ElevationStats:
         """Calculate elevation statistics with smoothing."""
         elevations = [tp.elevation for tp in trackpoints]
@@ -94,7 +95,7 @@ class GPXParser:
             )
 
         # Apply simple moving average smoothing (window of 5)
-        smoothed = self._smooth_elevations(elevations, window=5)
+        smoothed = GPXParser._smooth_elevations(elevations, window=5)
 
         total_ascent = 0.0
         total_descent = 0.0

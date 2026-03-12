@@ -1,8 +1,8 @@
 """Data merger for combining GPX, FIT, and media data by timestamp."""
 
 from bisect import bisect_left
-from datetime import timedelta
-from typing import List
+from datetime import datetime, timedelta
+from typing import List, Optional
 
 from ..models.hike_data import HikeData
 from ..models.media_item import MediaItem
@@ -14,6 +14,35 @@ class DataMerger:
 
     def __init__(self, hike_data: HikeData):
         self.hike_data = hike_data
+
+    @staticmethod
+    def tracks_overlap(
+        gpx_start: Optional[datetime],
+        gpx_end: Optional[datetime],
+        fit_start: Optional[datetime],
+        fit_end: Optional[datetime],
+        threshold: float = 0.5,
+    ) -> bool:
+        """Return True if the FIT track overlaps the GPX track by >= threshold.
+
+        Overlap is measured as a fraction of the FIT track's duration.
+        """
+        if not all([gpx_start, gpx_end, fit_start, fit_end]):
+            return False
+
+        overlap_start = max(gpx_start, fit_start)
+        overlap_end = min(gpx_end, fit_end)
+
+        if overlap_start >= overlap_end:
+            return False
+
+        overlap_duration = (overlap_end - overlap_start).total_seconds()
+        fit_duration = (fit_end - fit_start).total_seconds()
+
+        if fit_duration <= 0:
+            return False
+
+        return (overlap_duration / fit_duration) >= threshold
 
     def merge_heart_rate(
         self, hr_records: List[HRRecord], max_time_diff_seconds: int = 30
